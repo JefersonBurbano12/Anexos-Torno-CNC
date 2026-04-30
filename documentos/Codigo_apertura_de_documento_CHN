@@ -1,0 +1,358 @@
+function sim_fw_maquina_pingpong_control_RATE()
+clc; clear all;
+
+%% ===== Seleccionar CHN =====cm
+[chnFile, chnPath] = uigetfile('*.chn','Selecciona el archivo .chn');
+if isequal(chnFile,0), disp('Cancelado'); return; end
+chnFull = fullfile(chnPath, chnFile);
+
+events = parseCHN_events(chnFull);
+if isempty(events)
+    error("No se detectaron eventos en el .chn (no se encontraron strings entre comillas).");
+end
+
+%% ===== Parámetros físicos reales =====
+L_real = 11.0;      % [m] MOLDE 11 m
+D_real = 0.38;     % [m] 38 cm
+R = D_real/2;      % 0.19 m
+
+%% ===== Límites reales de máquina =====
+rpmMax = 150;                  % mandril máx
+t_ida_100 = 5;                 % s para una ida completa a 100%
+vMax = L_real / t_ida_100;     % 1.6 m/s
+
+%% ===== RATE (HMI) =====
+RATE = 40;                     % [%] inicial
+RATE = max(1, min(100, RATE));
+stepRate = 5;
+
+%% ===== Render/tiempo =====
+dtFrame = 0.02;    % paso fijo de “frame” (s)
+playback = 1.0;    % 1=tiempo real aproximado; 2 más lento; 0.5 más rápido
+
+%% ===== Visual máquina =====
+carriageOffsetY = R + 0.28;
+carriageSize    = [0.35 0.22 0.22];
+eyeletRadius    = 0.02;
+
+%% ===== Figura =====
+fig = figure('Name','Filament winding (ping-pong + RATE) 8m');
+grid on; axis equal; hold on;
+xlabel('X [m]'); ylabel('Y [m]'); zlabel('Z [m]');
+title('Ping-pong por capa + RATE (%) (botones)');
+view(3);
+
+xlim([-0.5, L_real+0.5]);
+ylim([-carriageOffsetY-0.5, carriageOffsetY+0.5]);
+zlim([-R-0.5, R+0.5]);
+
+%% ===== BOTONES HMI =====
+uicontrol(fig,'Style','pushbutton','String','RATE +','FontSize',11,...
+    'Position',[20 20 80 35],'Callback',@(~,~)changeRate(+stepRate));
+
+uicontrol(fig,'Style','pushbutton','String','RATE -','FontSize',11,...
+    'Position',[110 20 80 35],'Callback',@(~,~)changeRate(-stepRate));
+
+txtRate = uicontrol(fig,'Style','text','FontSize',11,...
+    'Position',[200 20 450 35],'BackgroundColor',get(fig,'Color'),...
+    'HorizontalAlignment','left');
+
+updateRateText();
+
+%% ===== Mandril con rotación visible =====
+tMandrel = hgtransform;
+[CX,CY,CZ] = makeCylinderMesh(R, 0, L_real, 100, 70);
+hCyl = surf(CX, CY, CZ, 'FaceAlpha', 0.18, 'EdgeAlpha', 0.07);
+set(hCyl, 'Parent', tMandrel);
+
+xStripe = linspace(0, L_real, 500);
+yStripe = R * ones(size(xStripe));
+zStripe = zeros(size(xStripe));
+hStripe = plot3(xStripe, yStripe, zStripe, 'LineWidth', 1.4);
+set(hStripe, 'Parent', tMandrel);
+
+%% ===== Carro =====
+tCarriage = hgtransform;
+hCar = drawBoxCentered(carriageSize);
+set(hCar,'Parent',tCarriage);
+
+[Ex,Ey,Ez] = sphere(18);
+hEyelet = surf(Ex*eyeletRadius, Ey*eyeletRadius, Ez*eyeletRadius, 'EdgeAlpha', 0.15);
+set(hEyelet,'Parent',tCarriage);
+
+%% ===== Fibra y trayectoria =====
+hFiber  = plot3([NaN NaN],[NaN NaN],[NaN NaN], 'LineWidth', 1.2);
+hPath   = animatedline('LineWidth', 1.2);
+hMarker = plot3(NaN,NaN,NaN,'ro','MarkerSize',5,'LineWidth',1);
+
+%% ===== Estado =====
+prevEnd = [];
+prevWasTransition = false;
+
+%% ===== Ejecutar secuencia CHN =====
+for i = 1:numel(events)
+    ev = events(i);
+
+    if ev.type == "TRANSITION"
+        prevWasTransition = true;
+        continue;
+    end
+
+    % Resolver mmt
+    mmtPath = resolveMMT(chnPath, ev.key);
+    if mmtPath == ""
+        warning("No encontré .mmt para key='%s'", ev.key);
+        prevWasTransition = false;
+        continue;
+    end
+    disp("CAPA: " + ev.key + " -> " + mmtPath);
+
+    % Leer MMT y extraer theta_base (giro). X del mmt NO manda aquí.
+    [P, ~, C_units] = readMMT_universal(mmtPath);
+    theta_base = unwrap((P(:,2) / C_units) * 2*pi);
+    theta_base = enforceMonotoneTheta(theta_base);  % nunca decrece
+
+    % Generar control ping-pong (una ida y una vuelta por capa)
+    [Xcmd, thetacmd] = buildPingPongControl(L_real, theta_base);
+
+    % Convertir a punto de contacto en el mandril
+    Y = R*cos(thetacmd);
+    Z = R*sin(thetacmd);
+
+    % Si el CHN pidió transición antes, enlazar suave al inicio del control
+    if prevWasTransition && ~isempty(prevEnd)
+        [Xt,Yt,Zt] = makeTransition(prevEnd, [Xcmd(1) Y(1) Z(1)], 220);
+        runSegment_RATE(Xt,Yt,Zt);  % ahora con RATE real
+    end
+    prevWasTransition = false;
+
+    % Ejecutar la capa (ida y vuelta real)
+    runSegment_RATE(Xcmd, Y, Z);
+
+    prevEnd = [Xcmd(end) Y(end) Z(end)];
+end
+
+disp("✅ Terminado: ping-pong + RATE funcionando.");
+
+%% ===== Segmento con RATE (CORREGIDO) =====
+    function runSegment_RATE(Xs,Ys,Zs)
+        n = numel(Xs);
+        if n < 2, return; end
+
+        % Medidas promedio de la discretización (para convertir a puntos/seg)
+        dXavg = mean(abs(diff(Xs)));
+        if ~isfinite(dXavg) || dXavg < 1e-9
+            dXavg = L_real / max(n,1);
+        end
+
+        % dTheta promedio de la trayectoria (en rad)
+        th = unwrap(atan2(Zs, Ys));
+        dThavg = mean(abs(diff(th)));
+        if ~isfinite(dThavg) || dThavg < 1e-9
+            dThavg = pi/50; % fallback
+        end
+
+        % A 100%: limites -> tiempo por punto mínimo por cada eje
+        omega100 = (rpmMax*2*pi/60);
+        tPoint100 = max(dXavg / vMax, dThavg / omega100);
+        ptsPerSec100 = 1 / max(tPoint100, 1e-6);
+
+        % Acumulador fraccional: avanza “puntos” según RATE
+        idx = 1;
+        acc = 0;
+
+        % Unwrap visual del mandril para que nunca “se invierta” por atan2
+        thVisCarry = th(1);
+
+        while idx <= n && ishandle(fig)
+            % velocidad actual por RATE
+            r = RATE/100;
+            ptsPerSec = max(0.1, r * ptsPerSec100); % mínimo para no congelar
+
+            % acumula avance en índices por frame
+            acc = acc + ptsPerSec * dtFrame;
+            step = floor(acc);
+            if step < 1
+                step = 1; % siempre avanza (si no, se ve “pegado”)
+            end
+            acc = acc - step;
+
+            idx2 = min(n, idx + step - 1);
+
+            % dibuja desde idx hasta idx2 (salta puntos si RATE alto)
+            for k = idx:idx2
+                addpoints(hPath, Xs(k), Ys(k), Zs(k));
+                set(hMarker,'XData',Xs(k),'YData',Ys(k),'ZData',Zs(k));
+
+                % rotación visible sin inversión (unwrap incremental)
+                thNow = atan2(Zs(k), Ys(k));
+                dth = mod((thNow - thVisCarry) + pi, 2*pi) - pi;
+                if dth < 0, dth = -dth; end
+                thVisCarry = thVisCarry + dth;
+                tMandrel.Matrix = makehgtform('xrotate', thVisCarry);
+
+                % carro
+                xCar = Xs(k); yCar = carriageOffsetY; zCar = 0;
+                tCarriage.Matrix = makehgtform('translate',[xCar yCar zCar]);
+
+                % fibra
+                eyeletPoint  = [xCar, yCar, zCar];
+                contactPoint = [Xs(k), Ys(k), Zs(k)];
+                set(hFiber, 'XData', [eyeletPoint(1) contactPoint(1)], ...
+                            'YData', [eyeletPoint(2) contactPoint(2)], ...
+                            'ZData', [eyeletPoint(3) contactPoint(3)]);
+            end
+
+            idx = idx2 + 1;
+
+            updateRateText();
+            drawnow;                 % IMPORTANTE: permite que entren los callbacks
+            pause(dtFrame * playback);
+        end
+    end
+
+%% ===== Callbacks HMI =====
+    function changeRate(dR)
+        RATE = RATE + dR;
+        RATE = max(1, min(100, RATE));
+        updateRateText();
+    end
+
+    function updateRateText()
+        v = (RATE/100) * vMax;
+        rpm = (RATE/100) * rpmMax;
+        txtRate.String = sprintf('RATE = %d %% | v = %.2f m/s | RPM = %.0f', RATE, v, rpm);
+    end
+
+end
+
+%% ===================== Control ping-pong (igual al tuyo) =====================
+function [Xcmd, thetaCmd] = buildPingPongControl(L, theta_base)
+N = numel(theta_base);
+if N < 10
+    N = 200;
+    theta_base = linspace(0, 50*pi, N)'; % fallback
+else
+    theta_base = theta_base(:);
+end
+
+u = linspace(0,1,N)';
+s = smoothstep(u);
+
+X1 = L * s;
+th1 = theta_base;
+
+X2 = L * (1 - s);
+
+dth = diff(th1);
+dth(dth<0) = abs(dth(dth<0));
+th2 = th1(end) + [0; cumsum(dth)];
+
+Xcmd = [X1; X2(2:end)];
+thetaCmd = [th1; th2(2:end)];
+end
+
+function s = smoothstep(u)
+s = 3*u.^2 - 2*u.^3;
+end
+
+function thm = enforceMonotoneTheta(th)
+th = th(:);
+d = diff(th);
+d(d < 0) = abs(d(d<0));
+thm = th(1) + [0; cumsum(d)];
+end
+
+%% ===================== CHN parser =====================
+function events = parseCHN_events(chnFull)
+txt = fileread(chnFull);
+lines = splitlines(string(txt));
+events = struct('type',{},'key',{});
+for k = 1:numel(lines)
+    ln = strtrim(lines(k));
+    if ln=="", continue; end
+    tok = regexp(ln,'"(.*?)"','tokens','once');
+    if isempty(tok), continue; end
+    key = string(tok{1});
+    if lower(key) == "transition"
+        events(end+1) = struct('type',"TRANSITION",'key',""); 
+    else
+        events(end+1) = struct('type',"LAYER",'key',key); 
+    end
+end
+end
+
+%% ===================== Resolver key -> .mmt =====================
+function mmtPath = resolveMMT(folder, key)
+cand = fullfile(folder, key + ".mmt");
+if isfile(cand), mmtPath = string(cand); return; end
+d = dir(fullfile(folder,'*.mmt'));
+names = string({d.name});
+idx = find(contains(lower(names), lower(key)), 1, 'first');
+if ~isempty(idx), mmtPath = string(fullfile(folder, names(idx)));
+else, mmtPath = ""; end
+end
+
+%% ===================== Lector MMT universal =====================
+function [P, L_units, C_units] = readMMT_universal(filePath)
+fid = fopen(filePath,'r');
+if fid < 0, error("No se pudo abrir: %s", filePath); end
+c = onCleanup(@() fclose(fid));
+
+raw = [];
+while ~feof(fid)
+    s = strtrim(strrep(fgetl(fid),',',' '));
+    if isempty(s) || contains(s,'"'), continue; end
+    nums = sscanf(s,'%f');
+    if numel(nums) >= 2
+        raw(end+1,1:2) = nums(1:2)'; %#ok<AGROW>
+    end
+end
+if isempty(raw), error("Sin datos numéricos en %s", filePath); end
+
+N = min(200, size(raw,1));
+C_units = mode(round(raw(1:N,2), 6));
+maskC = abs(raw(1:N,2)-C_units) < 1e-5;
+if any(maskC), L_units = max(raw(1:N,1)); else, L_units = max(raw(:,1)); end
+if ~(L_units > 0), L_units = max(raw(:,1)); end
+if ~(C_units > 0), C_units = max(raw(:,2)); end
+
+P = raw;
+end
+
+%% ===================== Transición suave =====================
+function [Xt,Yt,Zt] = makeTransition(p0, p1, n)
+t = linspace(0,1,n)';
+s = 3*t.^2 - 2*t.^3;
+Xt = p0(1) + (p1(1)-p0(1))*s;
+Yt = p0(2) + (p1(2)-p0(2))*s;
+Zt = p0(3) + (p1(3)-p0(3))*s;
+end
+
+%% ===================== Mandril mesh =====================
+function [X,Y,Z] = makeCylinderMesh(R, x0, x1, nTheta, nX)
+th = linspace(0,2*pi,nTheta);
+xx = linspace(x0,x1,nX);
+[TH,XX] = meshgrid(th, xx);
+X = XX;
+Y = R*cos(TH);
+Z = R*sin(TH);
+end
+
+%% ===================== Caja centrada =====================
+function h = drawBoxCentered(sz)
+Lx = sz(1); Ly = sz(2); Lz = sz(3);
+vx = [-Lx/2, Lx/2];
+vy = [-Ly/2, Ly/2];
+vz = [-Lz/2, Lz/2];
+[VX,VY,VZ] = ndgrid(vx,vy,vz);
+V = [VX(:), VY(:), VZ(:)];
+F = [ ...
+    1 3 4 2;
+    5 6 8 7;
+    1 2 6 5;
+    3 7 8 4;
+    1 5 7 3;
+    2 4 8 6];
+h = patch('Vertices',V,'Faces',F,'FaceAlpha',0.25,'EdgeAlpha',0.15);
+end
