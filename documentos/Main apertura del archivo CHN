@@ -1,0 +1,732 @@
+function results = CHN_3D_ID_main()
+% Conserva la dinamica/visualizacion 3D original y agrega:
+% 1) estructura funcional correcta para MATLAB,
+% 2) lectura CHN/CHW/MMT,
+% 3) generacion de setpoints,
+% 4) calculo y graficas de consignas de velocidad,
+% 5) datos listos para identificacion de planta.
+%
+% Uso:
+% Nota de ingenieria:
+% Con CHN/MMT/CHW se obtiene la referencia programada. Para identificar la
+% planta dinamica real se requieren mediciones reales de posicion/velocidad
+% de cada eje.
+
+clc; clear all;
+
+%% ===================== Seleccion de archivos =====================
+[chnFile, chnPath] = uigetfile('*.chn','Selecciona el archivo .chn');
+if isequal(chnFile,0), disp('Cancelado'); return; end
+chnFull = fullfile(chnPath, chnFile);
+
+[chwFile, chwPath] = uigetfile('*.chw','Selecciona el archivo .chw');
+if isequal(chwFile,0)
+    chwFull = "";
+    chw = struct();
+else
+    chwFull = string(fullfile(chwPath, chwFile));
+    chw = readCHW_params(chwFull);
+end
+
+events = parseCHN_events(chnFull);
+if isempty(events)
+    error('No se detectaron eventos en el .chn.');
+end
+
+%% ===================== Parametros fisicos reales =====================
+cfg = struct();
+cfg.L_real = 11.0;          % [m] longitud real del molde
+cfg.D_real = 0.38;          % [m]
+cfg.R      = cfg.D_real/2;  % [m]
+
+% Limites reales de maquina / HMI
+cfg.rpmMax = getCHW(chw,'MndrlVel',150);  % [rpm]
+cfg.t_ida_100 = 5;                       % [s] ida completa a 100%
+cfg.vMax = cfg.L_real / cfg.t_ida_100;   % [m/s]
+
+% RATE HMI
+RATE = 40;                               % [%]
+RATE = max(1, min(100, RATE));
+cfg.stepRate = 5;
+
+% Render/tiempo
+cfg.dtFrame  = 0.02;
+cfg.playback = 1.0;
+
+% Visual maquina
+cfg.carriageOffsetY = cfg.R + 0.28;
+cfg.carriageSize    = [0.35 0.22 0.22];
+cfg.eyeletRadius    = 0.02;
+
+% "MMT_ESCALADO": usa columna 1 del MMT como X escalado y columna 2 como theta.
+cfg.trajMode = "PINGPONG_ORIGINAL";
+
+% Graficas de control
+% liveControl: actualiza setpoints y consignas mientras corre la animacion 3D.
+% plotControl: deja graficas estaticas al inicio de cada capa; se deja apagado para evitar duplicar.
+cfg.liveControl = true;
+cfg.plotControl = false;
+
+%% ===================== Figura 3D original conservada =====================
+fig = figure('Name','MCAnderson filament winding 3D + consignas + identificacion');
+grid on; axis equal; hold on;
+xlabel('X [m]'); ylabel('Y [m]'); zlabel('Z [m]');
+title('Filament winding 3D - mandril/carro/fibra + RATE');
+view(3);
+
+xlim([-0.5, cfg.L_real+0.5]);
+ylim([-cfg.carriageOffsetY-0.5, cfg.carriageOffsetY+0.5]);
+zlim([-cfg.R-0.5, cfg.R+0.5]);
+
+%% ===================== Botones HMI =====================
+uicontrol(fig,'Style','pushbutton','String','RATE +','FontSize',11, ...
+    'Position',[20 20 80 35],'Callback',@(~,~)changeRate(+cfg.stepRate));
+
+uicontrol(fig,'Style','pushbutton','String','RATE -','FontSize',11, ...
+    'Position',[110 20 80 35],'Callback',@(~,~)changeRate(-cfg.stepRate));
+
+txtRate = uicontrol(fig,'Style','text','FontSize',11, ...
+    'Position',[200 20 520 35],'BackgroundColor',get(fig,'Color'), ...
+    'HorizontalAlignment','left');
+
+updateRateText();
+
+%% ===================== Mandril con rotacion visible =====================
+tMandrel = hgtransform;
+[CX,CY,CZ] = makeCylinderMesh(cfg.R, 0, cfg.L_real, 100, 70);
+hCyl = surf(CX, CY, CZ, 'FaceAlpha', 0.18, 'EdgeAlpha', 0.07);
+set(hCyl, 'Parent', tMandrel);
+
+xStripe = linspace(0, cfg.L_real, 500);
+yStripe = cfg.R * ones(size(xStripe));
+zStripe = zeros(size(xStripe));
+hStripe = plot3(xStripe, yStripe, zStripe, 'LineWidth', 1.4);
+set(hStripe, 'Parent', tMandrel);
+
+%% ===================== Carro =====================
+tCarriage = hgtransform;
+hCar = drawBoxCentered(cfg.carriageSize);
+set(hCar,'Parent',tCarriage);
+
+[Ex,Ey,Ez] = sphere(18);
+hEyelet = surf(Ex*cfg.eyeletRadius, Ey*cfg.eyeletRadius, Ez*cfg.eyeletRadius, 'EdgeAlpha', 0.15);
+set(hEyelet,'Parent',tCarriage);
+
+%% ===================== Fibra y trayectoria =====================
+hFiber  = plot3([NaN NaN],[NaN NaN],[NaN NaN], 'LineWidth', 1.2);
+hPath   = animatedline('LineWidth', 1.2);
+hMarker = plot3(NaN,NaN,NaN,'ro','MarkerSize',5,'LineWidth',1);
+
+%% ===================== Estado =====================
+prevEnd = [];
+prevWasTransition = false;
+mcanderson_results = struct();
+mcanderson_results.cfg = cfg;
+mcanderson_results.chw = chw;
+mcanderson_results.chnFile = string(chnFull);
+mcanderson_results.chwFile = string(chwFull);
+mcanderson_results.layers = struct([]);
+
+%% ===================== Ejecutar secuencia CHN =====================
+layerCount = 0;
+for i = 1:numel(events)
+    ev = events(i);
+
+    if ev.type == "TRANSITION"
+        prevWasTransition = true;
+        continue;
+    end
+
+    mmtPath = resolveMMT(chnPath, ev.key);
+    if mmtPath == ""
+        warning('No encontre .mmt para key=''%s''', ev.key);
+        prevWasTransition = false;
+        continue;
+    end
+
+    disp("CAPA: " + ev.key + " -> " + mmtPath);
+
+    layerCount = layerCount + 1;
+
+    layer = buildLayerReference(mmtPath, ev.key, cfg);
+
+    % Si el CHN pidio transicion antes, enlazar suave al inicio de la capa
+    if prevWasTransition && ~isempty(prevEnd)
+        [Xt,Yt,Zt] = makeTransition(prevEnd, [layer.Xref(1) layer.Yref(1) layer.Zref(1)], 220);
+        runSegment_RATE(Xt,Yt,Zt, [], []);
+    end
+    prevWasTransition = false;
+
+    % Graficas de setpoints y consignas de velocidad
+    live = [];
+    if cfg.liveControl
+        live = initLiveControlFigure(layer, layerCount);
+    end
+    if cfg.plotControl
+        plotLayerControl(layer, layerCount);
+    end
+
+    % Ejecutar dinamica/animacion 3D original sincronizada con graficas
+    runSegment_RATE(layer.Xref, layer.Yref, layer.Zref, layer, live);
+
+    prevEnd = [layer.Xref(end) layer.Yref(end) layer.Zref(end)];
+
+    mcanderson_results.layers(layerCount).key       = ev.key;
+    mcanderson_results.layers(layerCount).mmtPath   = mmtPath;
+    mcanderson_results.layers(layerCount).t         = layer.t;
+    mcanderson_results.layers(layerCount).Xref      = layer.Xref;
+    mcanderson_results.layers(layerCount).thetaRef  = layer.thetaRef;
+    mcanderson_results.layers(layerCount).Yref      = layer.Yref;
+    mcanderson_results.layers(layerCount).Zref      = layer.Zref;
+    mcanderson_results.layers(layerCount).vX_cmd    = layer.vX_cmd;
+    mcanderson_results.layers(layerCount).omega_cmd = layer.omega_cmd;
+    mcanderson_results.layers(layerCount).rpm_cmd   = layer.rpm_cmd;
+    mcanderson_results.layers(layerCount).leadAngle = layer.leadAngle;
+end
+
+assignin('base','mcanderson_results',mcanderson_results);
+assignin('base','mcanderson_cfg',cfg);
+assignin('base','mcanderson_chw',chw);
+
+disp('Terminado: dinamica 3D conservada + consignas + datos para identificacion.');
+
+%% ===================== Segmento 3D con RATE =====================
+    function runSegment_RATE(Xs,Ys,Zs, layerData, live)
+        if nargin < 4, layerData = []; end
+        if nargin < 5, live = []; end
+        n = numel(Xs);
+        if n < 2, return; end
+
+        dXavg = mean(abs(diff(Xs)));
+        if ~isfinite(dXavg) || dXavg < 1e-9
+            dXavg = cfg.L_real / max(n,1);
+        end
+
+        th = unwrap(atan2(Zs, Ys));
+        dThavg = mean(abs(diff(th)));
+        if ~isfinite(dThavg) || dThavg < 1e-9
+            dThavg = pi/50;
+        end
+
+        omega100 = cfg.rpmMax*2*pi/60;
+        tPoint100 = max(dXavg / cfg.vMax, dThavg / omega100);
+        ptsPerSec100 = 1 / max(tPoint100, 1e-6);
+
+        idx = 1;
+        acc = 0;
+        thVisCarry = th(1);
+
+        while idx <= n && ishandle(fig)
+            r = RATE/100;
+            ptsPerSec = max(0.1, r * ptsPerSec100);
+
+            acc = acc + ptsPerSec * cfg.dtFrame;
+            step = floor(acc);
+            if step < 1
+                step = 1;
+            end
+            acc = acc - step;
+
+            idx2 = min(n, idx + step - 1);
+
+            for k = idx:idx2
+                addpoints(hPath, Xs(k), Ys(k), Zs(k));
+                set(hMarker,'XData',Xs(k),'YData',Ys(k),'ZData',Zs(k));
+
+                % Rotacion visual sin inversion aparente
+                thNow = atan2(Zs(k), Ys(k));
+                dth = mod((thNow - thVisCarry) + pi, 2*pi) - pi;
+                if dth < 0
+                    dth = -dth;
+                end
+                thVisCarry = thVisCarry + dth;
+                tMandrel.Matrix = makehgtform('xrotate', thVisCarry);
+
+                % Carro
+                xCar = Xs(k); yCar = cfg.carriageOffsetY; zCar = 0;
+                tCarriage.Matrix = makehgtform('translate',[xCar yCar zCar]);
+
+                % Fibra entre ojo y punto de contacto
+                eyeletPoint  = [xCar, yCar, zCar];
+                contactPoint = [Xs(k), Ys(k), Zs(k)];
+                set(hFiber, 'XData', [eyeletPoint(1) contactPoint(1)], ...
+                            'YData', [eyeletPoint(2) contactPoint(2)], ...
+                            'ZData', [eyeletPoint(3) contactPoint(3)]);
+            end
+
+            if ~isempty(live) && ~isempty(layerData)
+                updateLiveControl(live, layerData, idx2, RATE/100);
+            end
+
+            idx = idx2 + 1;
+
+            updateRateText();
+            drawnow limitrate;
+            pause(cfg.dtFrame * cfg.playback);
+        end
+    end
+
+%% ===================== Callbacks HMI =====================
+    function changeRate(dR)
+        RATE = RATE + dR;
+        RATE = max(1, min(100, RATE));
+        updateRateText();
+    end
+
+    function updateRateText()
+        v = (RATE/100) * cfg.vMax;
+        rpm = (RATE/100) * cfg.rpmMax;
+        txtRate.String = sprintf('RATE = %d %% | vX_lim = %.2f m/s | RPM_lim = %.0f', RATE, v, rpm);
+    end
+end
+
+%% =========================== FUNCIONES LOCALES ===========================
+
+function layer = buildLayerReference(mmtPath, key, cfg)
+% Genera los setpoints de posicion y velocidad para una capa.
+
+[pathData, headerData] = readMMT_path(mmtPath);
+
+if isempty(pathData)
+    error('Sin datos de trayectoria en %s', mmtPath);
+end
+
+% C_units se usa como escala angular. En tus MMT aparece 15.7079633.
+% Si no existe, se toma el maximo de la columna 2 como fallback.
+if isfield(headerData,'C_units') && headerData.C_units > 0
+    C_units = headerData.C_units;
+else
+    C_units = max(abs(pathData(:,2)));
+end
+if ~(C_units > 0), C_units = 1; end
+
+switch upper(string(cfg.trajMode))
+    case "PINGPONG_ORIGINAL"
+        % Conserva la logica original: theta viene del MMT y X es ida/vuelta
+        theta_base = unwrap((pathData(:,2) / C_units) * 2*pi);
+        theta_base = enforceMonotoneTheta(theta_base);
+        [Xref, thetaRef] = buildPingPongControl(cfg.L_real, theta_base);
+
+    case "MMT_ESCALADO"
+        % Alternativa para auditoria: usa la trayectoria del archivo como X
+        xRaw = pathData(:,1);
+        thetaRaw = unwrap((pathData(:,2) / C_units) * 2*pi);
+        thetaRaw = enforceMonotoneTheta(thetaRaw);
+        Xref = scaleToRange(xRaw, 0, cfg.L_real);
+        thetaRef = thetaRaw;
+
+    otherwise
+        error('trajMode no reconocido: %s', cfg.trajMode);
+end
+
+Yref = cfg.R*cos(thetaRef);
+Zref = cfg.R*sin(thetaRef);
+
+[t, vX_cmd, omega_cmd, rpm_cmd] = computeCommandProfiles(Xref, thetaRef, cfg);
+leadAngle = computeLeadAngle(Xref, thetaRef, cfg.R);
+
+layer = struct();
+layer.key = key;
+layer.mmtPath = string(mmtPath);
+layer.Xref = Xref(:);
+layer.thetaRef = thetaRef(:);
+layer.Yref = Yref(:);
+layer.Zref = Zref(:);
+layer.t = t(:);
+layer.vX_cmd = vX_cmd(:);
+layer.omega_cmd = omega_cmd(:);
+layer.rpm_cmd = rpm_cmd(:);
+layer.leadAngle = leadAngle(:);
+layer.C_units = C_units;
+end
+
+function [t, vX, omega, rpm] = computeCommandProfiles(Xref, thetaRef, cfg)
+% Calcula consignas de velocidad a partir de setpoints de posicion.
+% La parametrizacion temporal respeta limites RATE=100 de maquina.
+% El RATE dinamico de HMI cambia la animacion; esta grafica representa la
+% consigna nominal programada a 100%.
+
+Xref = Xref(:);
+thetaRef = thetaRef(:);
+
+n = numel(Xref);
+if n < 2
+    t = 0; vX = 0; omega = 0; rpm = 0; return;
+end
+
+dX = abs(diff(Xref));
+dTh = abs(diff(thetaRef));
+
+omegaMax = cfg.rpmMax*2*pi/60;
+vMax = cfg.vMax;
+
+dtX = dX / max(vMax, 1e-9);
+dtR = dTh / max(omegaMax, 1e-9);
+dt = max(dtX, dtR);
+
+% Evita dt cero por puntos repetidos
+valid = dt(isfinite(dt) & dt > 0);
+if isempty(valid)
+    dtMin = 1e-3;
+else
+    dtMin = max(min(valid), 1e-4);
+end
+dt(~isfinite(dt) | dt <= 0) = dtMin;
+
+t = [0; cumsum(dt)];
+
+vX = gradient(Xref, t);
+omega = gradient(thetaRef, t);
+rpm = omega * 60/(2*pi);
+end
+
+function leadAngle = computeLeadAngle(Xref, thetaRef, R)
+% Angulo de bobinado aproximado respecto al eje axial.
+% alpha = atan(velocidad tangencial / velocidad axial) o equivalente local.
+
+Xref = Xref(:);
+thetaRef = thetaRef(:);
+
+dx = gradient(Xref);
+dsCirc = R * gradient(thetaRef);
+leadAngle = atan2d(abs(dsCirc), max(abs(dx), 1e-9));
+end
+
+function plotLayerControl(layer, layerIndex)
+% Grafica setpoints y consignas de control para una capa.
+
+figure('Name',sprintf('Consignas control - Capa %d - %s', layerIndex, layer.key));
+tl = tiledlayout(5,1,'TileSpacing','compact','Padding','compact');
+title(tl, sprintf('Capa %d: %s', layerIndex, layer.key), 'Interpreter','none');
+
+nexttile;
+plot(layer.t, layer.Xref, 'LineWidth', 1.2); grid on;
+ylabel('X_{ref} [m]');
+
+nexttile;
+plot(layer.t, layer.thetaRef, 'LineWidth', 1.2); grid on;
+ylabel('\theta_{ref} [rad]');
+
+nexttile;
+plot(layer.t, layer.vX_cmd, 'LineWidth', 1.2); grid on;
+ylabel('v_X cmd [m/s]');
+
+nexttile;
+plot(layer.t, layer.rpm_cmd, 'LineWidth', 1.2); grid on;
+ylabel('RPM cmd');
+
+nexttile;
+plot(layer.t, layer.leadAngle, 'LineWidth', 1.2); grid on;
+ylabel('\alpha [deg]'); xlabel('Tiempo nominal [s]');
+end
+
+
+function live = initLiveControlFigure(layer, layerIndex)
+% Crea graficas sincronizadas en tiempo real con la animacion 3D.
+% La linea punteada es la referencia nominal completa.
+% La linea continua se va dibujando al mismo tiempo que avanza el mandril/carro.
+
+figName = sprintf('Tiempo real - consignas - Capa %d - %s', layerIndex, char(layer.key));
+live = struct();
+live.fig = figure('Name', figName);
+tl = tiledlayout(5,1,'TileSpacing','compact','Padding','compact');
+live.titleHandle = title(tl, sprintf('Tiempo real - Capa %d: %s', layerIndex, char(layer.key)), 'Interpreter','none');
+
+[live.ax(1), live.refX, live.lineX, live.markerX, live.cursorX] = setupLiveAxis(layer.t, layer.Xref, 'X_{ref} / carro [m]');
+[live.ax(2), live.refTheta, live.lineTheta, live.markerTheta, live.cursorTheta] = setupLiveAxis(layer.t, layer.thetaRef, '\theta_{ref} / mandril [rad]');
+[live.ax(3), live.refVX, live.lineVX, live.markerVX, live.cursorVX] = setupLiveAxis(layer.t, layer.vX_cmd, 'v_X cmd efectiva [m/s]');
+[live.ax(4), live.refRPM, live.lineRPM, live.markerRPM, live.cursorRPM] = setupLiveAxis(layer.t, layer.rpm_cmd, 'RPM cmd efectiva');
+[live.ax(5), live.refAlpha, live.lineAlpha, live.markerAlpha, live.cursorAlpha] = setupLiveAxis(layer.t, layer.leadAngle, '\alpha [deg]');
+xlabel(live.ax(5), 'Tiempo nominal de trayectoria [s]');
+
+linkaxes(live.ax, 'x');
+for i = 1:numel(live.ax)
+    xlim(live.ax(i), [0 max(layer.t(end), eps)]);
+end
+
+live.layerIndex = layerIndex;
+live.key = layer.key;
+drawnow;
+end
+
+function [ax, hRef, hLive, hMarker, hCursor] = setupLiveAxis(t, y, yLabelText)
+% Eje individual para senales de tiempo real.
+
+ax = nexttile;
+hold(ax, 'on'); grid(ax, 'on');
+hRef = plot(ax, t, y, ':', 'LineWidth', 0.8);
+hLive = animatedline('Parent', ax, 'LineWidth', 1.4);
+hMarker = plot(ax, NaN, NaN, 'o', 'MarkerSize', 4, 'LineWidth', 1.0);
+ylabel(ax, yLabelText);
+
+if isempty(t) || ~isfinite(t(end))
+    t0 = 0;
+else
+    t0 = t(1);
+end
+
+if isempty(y) || all(~isfinite(y))
+    ylim(ax, [-1 1]);
+else
+    yy = y(isfinite(y));
+    if isempty(yy)
+        ylim(ax, [-1 1]);
+    else
+        ymin = min(yy); ymax = max(yy);
+        if abs(ymax-ymin) < 1e-9
+            pad = max(1, abs(ymax)*0.1);
+            ylim(ax, [ymin-pad ymax+pad]);
+        end
+    end
+end
+
+yl = ylim(ax);
+hCursor = line(ax, [t0 t0], yl, 'LineStyle','--', 'LineWidth',0.8);
+end
+
+function updateLiveControl(live, layer, k, rateFrac)
+% Actualiza graficas sincronizadas con el punto actual de la animacion.
+% vX y RPM se muestran como consigna efectiva escalada por RATE.
+
+if isempty(live) || ~isstruct(live) || ~isfield(live,'fig') || ~ishandle(live.fig)
+    return;
+end
+
+n = numel(layer.t);
+if n < 1, return; end
+k = max(1, min(k, n));
+rateFrac = max(0.01, min(1.0, rateFrac));
+
+tNow = layer.t(k);
+xNow = layer.Xref(k);
+thNow = layer.thetaRef(k);
+vxNow = rateFrac * layer.vX_cmd(k);
+rpmNow = rateFrac * layer.rpm_cmd(k);
+alphaNow = layer.leadAngle(k);
+
+addpoints(live.lineX, tNow, xNow);
+addpoints(live.lineTheta, tNow, thNow);
+addpoints(live.lineVX, tNow, vxNow);
+addpoints(live.lineRPM, tNow, rpmNow);
+addpoints(live.lineAlpha, tNow, alphaNow);
+
+set(live.markerX, 'XData', tNow, 'YData', xNow);
+set(live.markerTheta, 'XData', tNow, 'YData', thNow);
+set(live.markerVX, 'XData', tNow, 'YData', vxNow);
+set(live.markerRPM, 'XData', tNow, 'YData', rpmNow);
+set(live.markerAlpha, 'XData', tNow, 'YData', alphaNow);
+
+updateCursor(live.cursorX, live.ax(1), tNow);
+updateCursor(live.cursorTheta, live.ax(2), tNow);
+updateCursor(live.cursorVX, live.ax(3), tNow);
+updateCursor(live.cursorRPM, live.ax(4), tNow);
+updateCursor(live.cursorAlpha, live.ax(5), tNow);
+
+if isfield(live,'titleHandle') && ishandle(live.titleHandle)
+    live.titleHandle.String = sprintf('Tiempo real - Capa %d: %s | RATE = %.0f %% | punto %d/%d', ...
+        live.layerIndex, char(live.key), 100*rateFrac, k, n);
+end
+
+drawnow limitrate;
+end
+
+function updateCursor(hCursor, ax, tNow)
+if ishandle(hCursor) && ishandle(ax)
+    yl = ylim(ax);
+    set(hCursor, 'XData', [tNow tNow], 'YData', yl);
+end
+end
+
+function [Xcmd, thetaCmd] = buildPingPongControl(L, theta_base)
+% Misma idea de tu funcion: ida y vuelta por capa, theta monotona.
+
+theta_base = theta_base(:);
+N = numel(theta_base);
+if N < 10
+    N = 200;
+    theta_base = linspace(0, 50*pi, N)';
+end
+
+u = linspace(0,1,N)';
+s = smoothstep(u);
+
+X1 = L * s;
+th1 = theta_base;
+
+X2 = L * (1 - s);
+
+dth = diff(th1);
+dth(dth<0) = abs(dth(dth<0));
+th2 = th1(end) + [0; cumsum(dth)];
+
+Xcmd = [X1; X2(2:end)];
+thetaCmd = [th1; th2(2:end)];
+end
+
+function s = smoothstep(u)
+s = 3*u.^2 - 2*u.^3;
+end
+
+function thm = enforceMonotoneTheta(th)
+th = th(:);
+d = diff(th);
+d(d < 0) = abs(d(d < 0));
+thm = th(1) + [0; cumsum(d)];
+end
+
+function y = scaleToRange(x, a, b)
+x = x(:);
+xmin = min(x); xmax = max(x);
+if abs(xmax-xmin) < 1e-12
+    y = a*ones(size(x));
+else
+    y = a + (x-xmin)*(b-a)/(xmax-xmin);
+end
+end
+
+function events = parseCHN_events(chnFull)
+% Extrae eventos entre comillas desde el CHN.
+
+txt = fileread(chnFull);
+lines = splitlines(string(txt));
+events = struct('type',{},'key',{});
+for k = 1:numel(lines)
+    ln = strtrim(lines(k));
+    if ln == "", continue; end
+    tok = regexp(ln,'"(.*?)"','tokens','once');
+    if isempty(tok), continue; end
+    key = string(tok{1});
+    if lower(key) == "transition"
+        events(end+1) = struct('type',"TRANSITION",'key',""); 
+    else
+        events(end+1) = struct('type',"LAYER",'key',key);
+    end
+end
+end
+
+function mmtPath = resolveMMT(folder, key)
+% Resuelve key del CHN contra archivos MMT del folder.
+
+cand = fullfile(folder, char(key + ".mmt"));
+if isfile(cand)
+    mmtPath = string(cand);
+    return;
+end
+
+d = dir(fullfile(folder,'*.mmt'));
+names = string({d.name});
+idx = find(contains(lower(names), lower(key)), 1, 'first');
+if ~isempty(idx)
+    mmtPath = string(fullfile(folder, names(idx)));
+else
+    mmtPath = "";
+end
+end
+
+function [pathData, headerData] = readMMT_path(filePath)
+% Lector MMT orientado a trayectoria.
+% - Ignora lineas con texto.
+% - Toma como trayectoria principal las lineas con 3 columnas numericas.
+% - Toma como C_units la segunda columna de las primeras lineas de 2 columnas.
+
+fid = fopen(filePath,'r');
+if fid < 0, error('No se pudo abrir: %s', filePath); end
+c = onCleanup(@() fclose(fid));
+
+pairs = [];
+triples = [];
+
+while ~feof(fid)
+    s = strtrim(strrep(fgetl(fid),',',' '));
+    if isempty(s) || contains(s,'"'), continue; end
+    nums = sscanf(s,'%f')';
+    if numel(nums) == 2
+        pairs(end+1,1:2) = nums(1:2); %#ok<AGROW>
+    elseif numel(nums) >= 3
+        triples(end+1,1:3) = nums(1:3); %#ok<AGROW>
+    end
+end
+
+headerData = struct();
+if ~isempty(pairs)
+    headerData.L_units = max(pairs(:,1));
+    headerData.C_units = mode(round(pairs(:,2), 6));
+else
+    headerData.L_units = NaN;
+    headerData.C_units = NaN;
+end
+
+pathData = triples;
+end
+
+function chw = readCHW_params(chwFull)
+% Lee pares $Campo / valor desde archivo CHW.
+
+txt = fileread(chwFull);
+lines = splitlines(string(txt));
+chw = struct();
+
+k = 1;
+while k <= numel(lines)
+    ln = strtrim(lines(k));
+    if startsWith(ln,"$")
+        name = erase(ln,"$");
+        field = matlab.lang.makeValidName(char(name));
+        value = "";
+        if k+1 <= numel(lines)
+            value = strtrim(lines(k+1));
+        end
+        num = str2double(value);
+        if isfinite(num)
+            chw.(field) = num;
+        else
+            chw.(field) = value;
+        end
+        k = k + 2;
+    else
+        k = k + 1;
+    end
+end
+end
+
+function val = getCHW(chw, field, defaultVal)
+if isstruct(chw) && isfield(chw, field)
+    val = chw.(field);
+else
+    val = defaultVal;
+end
+end
+
+function [Xt,Yt,Zt] = makeTransition(p0, p1, n)
+t = linspace(0,1,n)';
+s = 3*t.^2 - 2*t.^3;
+Xt = p0(1) + (p1(1)-p0(1))*s;
+Yt = p0(2) + (p1(2)-p0(2))*s;
+Zt = p0(3) + (p1(3)-p0(3))*s;
+end
+
+function [X,Y,Z] = makeCylinderMesh(R, x0, x1, nTheta, nX)
+th = linspace(0,2*pi,nTheta);
+xx = linspace(x0,x1,nX);
+[TH,XX] = meshgrid(th, xx);
+X = XX;
+Y = R*cos(TH);
+Z = R*sin(TH);
+end
+
+function h = drawBoxCentered(sz)
+Lx = sz(1); Ly = sz(2); Lz = sz(3);
+vx = [-Lx/2, Lx/2];
+vy = [-Ly/2, Ly/2];
+vz = [-Lz/2, Lz/2];
+[VX,VY,VZ] = ndgrid(vx,vy,vz);
+V = [VX(:), VY(:), VZ(:)];
+F = [ ...
+    1 3 4 2;
+    5 6 8 7;
+    1 2 6 5;
+    3 7 8 4;
+    1 5 7 3;
+    2 4 8 6];
+h = patch('Vertices',V,'Faces',F,'FaceAlpha',0.25,'EdgeAlpha',0.15);
+end
