@@ -1,0 +1,1566 @@
+function OUT = fw_control_maestro_esclavo_de_xlsx()
+%FW_CONTROL_MASTER_SLAVE_FROM_XLSX_REAL_CONTROL
+% Control maestro-esclavo para maquina filament winding 2 ejes - CILINDRO.
+%
+% Maestro : mandril  (eje rotativo)
+% Esclavo : carrito  (eje lineal)
+%
+% LOGICA CORRECTA:
+%   1. Mandril baja en helicoidales.
+%   2. Mandril NO baja por limites del carrito.
+%   3. Carrito baja en helicoidales.
+%   4. Carrito baja adicionalmente en limites y reversas.
+%   5. La S-curve actua sobre el comando seguro del carrito.
+%   6. El 3D muestra la respuesta real corregida.
+%   7. Las graficas muestran referencia, comando seguro y respuesta real.
+
+clc;
+
+%  1. SELECCIONAR XLSX
+%% -----------------------------------------------------------------------
+
+[fileName, filePath] = uigetfile( ...
+    {'*.xlsx;*.xls','Archivos Excel (*.xlsx, *.xls)'}, ...
+    'Seleccionar archivo de trayectoria');
+
+if isequal(fileName, 0)
+    error('No se selecciono ningun archivo.');
+end
+
+xlsxFile = fullfile(filePath, fileName);
+
+%  2. LEER HOJA
+%% ----------------------------------------------------------------------
+
+sheets = get_sheet_names(xlsxFile);
+
+if any(strcmpi(sheets,'Controlador'))
+    sheetName = 'Controlador';
+elseif any(strcmpi(sheets,'Trayectoria'))
+    sheetName = 'Trayectoria';
+else
+    error('No hay hoja Controlador ni Trayectoria.');
+end
+
+T = readtable(xlsxFile, 'Sheet', sheetName);
+
+
+%  3. DETECTAR COLUMNAS
+%% -----------------------------------------------------------------------
+
+rotCol = find_column(T, { ...
+    'Mandrel_Rotation_deg', ...
+    'Mandrel_Rotation', ...
+    'Rotation_deg', ...
+    'Theta_deg', ...
+    'Rotacion_Mandril_deg'});
+
+linCol = find_column(T, { ...
+    'Carriage_Position_mm', ...
+    'Carriage_Position', ...
+    'Position_mm', ...
+    'Z_mm', ...
+    'Posicion_Carro_mm'});
+
+timeCol = find_column(T, { ...
+    'Time_s', ...
+    'Time', ...
+    't_s', ...
+    'Tiempo_s'});
+
+if isempty(rotCol)
+    error('No se encontro columna de rotacion del mandril.');
+end
+
+if isempty(linCol)
+    error('No se encontro columna de posicion del carrito.');
+end
+
+theta_ref_raw = double(T.(rotCol));
+z_ref_raw     = double(T.(linCol));
+
+theta_ref_raw = theta_ref_raw(:);
+z_ref_raw     = z_ref_raw(:);
+
+if isempty(timeCol)
+    t_raw_orig = (0:numel(theta_ref_raw)-1)' * 0.05;
+else
+    t_raw_orig = double(T.(timeCol));
+    t_raw_orig = t_raw_orig(:);
+end
+
+%  4. CONFIGURACION DEL USUARIO
+%% -----------------------------------------------------------------------
+
+%  VELOCIDAD GENERAL DE LA MAQUINA
+
+SpeedPercent_User = 10;        % Cambiar aqui: 0 a 100 [%]
+
+%  REDUCCION EN TRAYECTORIAS HELICOIDALES
+
+HelicalSpeedPercent_User = 30; % 1 a 100 [%]
+
+% Ejemplo:
+% SpeedPercent_User = 10
+% HelicalSpeedPercent_User = 30
+% Velocidad efectiva helicoidal = 3 %
+
+%  LIMITES REALES DE MAQUINA
+
+MandrelMax_rpm   = 150;        % mandril: -150 a +150 rpm
+CarriageMax_mm_s = 762;        % carrito: -762 a +762 mm/s
+
+%  S-CURVE DEL CARRITO EN LIMITES Y REVERSAS
+
+SCurve_decel_pct     = 0.12;   % 12 % del recorrido por extremo
+SCurve_decel_min     = 80;     % distancia minima de desaceleracion [mm]
+SCurve_limit_min_pct = 0.05;   % velocidad minima cerca del limite = 5 %
+
+ReverseSpeedPercent  = 0.12;   % velocidad local maxima en reversa = 12 %
+
+AnimationTimeScale = 0.025;    % mayor = animacion mas lenta
+
+%  VALIDACION
+
+SpeedPercent        = min(max(SpeedPercent_User, 0), 100);
+HelicalSpeedPercent = min(max(HelicalSpeedPercent_User, 1), 100);
+
+MandrelMax_rpm   = abs(MandrelMax_rpm);
+CarriageMax_mm_s = abs(CarriageMax_mm_s);
+
+zeroSpeedMode = SpeedPercent <= 0;
+
+MandrelMax_deg_s = MandrelMax_rpm * 360 / 60;
+MandrelMax_rad_s = MandrelMax_rpm * 2*pi / 60;
+
+%  5. LIMPIAR Y ORDENAR DATOS
+%% -----------------------------------------------------------------------
+
+valid = isfinite(t_raw_orig) & ...
+        isfinite(theta_ref_raw) & ...
+        isfinite(z_ref_raw);
+
+t_raw_orig    = t_raw_orig(valid);
+theta_ref_raw = theta_ref_raw(valid);
+z_ref_raw     = z_ref_raw(valid);
+
+if numel(theta_ref_raw) < 2
+    error('Menos de 2 puntos validos en la trayectoria.');
+end
+
+[t_raw_orig, ix] = sort(t_raw_orig);
+theta_ref_raw = theta_ref_raw(ix);
+z_ref_raw     = z_ref_raw(ix);
+
+[t_raw_orig, iu] = unique(t_raw_orig,'stable');
+theta_ref_raw = theta_ref_raw(iu);
+z_ref_raw     = z_ref_raw(iu);
+
+if numel(theta_ref_raw) < 2
+    error('Despues de limpiar, quedan menos de 2 puntos validos.');
+end
+
+%  6. RECALCULAR TIEMPO DE SINCRONISMO
+% ------------------------------------------------------------------------
+%  Logica correcta:
+%
+%  Mandril:
+%     - SpeedPercent en zonas normales.
+%     - SpeedPercent * HelicalSpeedPercent en helicoidales.
+%     - NO baja por limites del carrito.
+%
+%  Carrito:
+%     - SpeedPercent en zonas normales.
+%     - SpeedPercent * HelicalSpeedPercent en helicoidales.
+%     - Baja adicionalmente cerca de z_min, z_max y reversas.
+%% -----------------------------------------------------------------------
+
+SyncSafetyFactor = 1.60;
+MinSegmentTime   = 0.040;
+
+nRaw = numel(theta_ref_raw);
+
+t_raw             = zeros(nRaw,1);
+isHelical_raw     = false(nRaw,1);
+isReverse_raw     = false(nRaw,1);
+localSpeedPct_raw = zeros(nRaw,1);
+limitScalePct_raw = 100*ones(nRaw,1);
+mandrelSpeedPct_raw = zeros(nRaw,1);
+
+z_min_raw  = min(z_ref_raw);
+z_max_raw  = max(z_ref_raw);
+z_span_raw = z_max_raw - z_min_raw;
+
+decel_dist_raw = max(z_span_raw * SCurve_decel_pct, SCurve_decel_min);
+
+if zeroSpeedMode
+
+    warning('SpeedPercent = 0. Maquina lista, sin movimiento.');
+    t_raw = (0:nRaw-1)' * 0.05;
+    localSpeedPct_raw(:) = 0;
+    limitScalePct_raw(:) = 0;
+    mandrelSpeedPct_raw(:) = 0;
+
+else
+
+    sf = SpeedPercent / 100;
+    dz_prev = 0;
+
+    for k = 2:nRaw
+
+        dth = theta_ref_raw(k) - theta_ref_raw(k-1);
+        dz  = z_ref_raw(k)     - z_ref_raw(k-1);
+
+        % Detectar helicoidal: rotacion y desplazamiento al mismo tiempo
+        helicoidal = abs(dth) > 1e-6 && abs(dz) > 1e-6;
+        isHelical_raw(k) = helicoidal;
+
+        if helicoidal
+            helicalFactor = HelicalSpeedPercent / 100;
+        else
+            helicalFactor = 1.0;
+        end
+
+        % Detectar reversa del carrito
+        reverseNow = abs(dz_prev) > 1e-9 && ...
+                     abs(dz) > 1e-9 && ...
+                     sign(dz_prev) ~= sign(dz);
+
+        isReverse_raw(k) = reverseNow;
+
+        if abs(dz) > 1e-9
+            dz_prev = dz;
+        end
+
+        % ------------------------------------------------------------
+        % Mandril:
+        % baja en helicoidales, baja por limites del carrito
+        % ------------------------------------------------------------
+        mandrelSpeedFactor = sf * helicalFactor;
+
+        % ------------------------------------------------------------
+        % Carrito:
+        % baja en helicoidales y baja adicional por limites
+        % ------------------------------------------------------------
+
+        z_mid = 0.5 * (z_ref_raw(k) + z_ref_raw(k-1));
+
+        dist_to_limit = min(z_mid - z_min_raw, z_max_raw - z_mid);
+        dist_to_limit = max(dist_to_limit, 0);
+
+        q = dist_to_limit / max(decel_dist_raw, eps);
+        q = clamp_value(q, 0, 1);
+
+        % S-curve del carrito
+        sLim = smootherstep(q);
+
+        limitFactor = SCurve_limit_min_pct + ...
+            (1 - SCurve_limit_min_pct) * sLim;
+
+        if reverseNow
+            limitFactor = min(limitFactor, max(SCurve_limit_min_pct, ReverseSpeedPercent));
+        end
+
+        carriageSpeedFactor = sf * helicalFactor * limitFactor;
+
+        mandrelSpeedFactor  = clamp_value(mandrelSpeedFactor,  1e-5, 1);
+        carriageSpeedFactor = clamp_value(carriageSpeedFactor, 1e-5, 1);
+
+        mandrelSpeedPct_raw(k) = mandrelSpeedFactor * 100;
+        localSpeedPct_raw(k)   = carriageSpeedFactor * 100;
+        limitScalePct_raw(k)   = limitFactor * 100;
+
+        % Limites locales
+        omLim = MandrelMax_deg_s * mandrelSpeedFactor / SyncSafetyFactor;
+        vLim  = CarriageMax_mm_s * carriageSpeedFactor / SyncSafetyFactor;
+
+        omLim = max(omLim, 1e-6);
+        vLim  = max(vLim, 1e-6);
+
+        % Tiempo:
+        % Si hay giro, manda el mandril.
+        % Si no hay giro, manda el carrito.
+        if abs(dth) > 1e-9
+            dt_rot = abs(dth) / omLim;
+            dts = max(dt_rot, MinSegmentTime);
+        else
+            dt_car = abs(dz) / vLim;
+            dts = max(dt_car, MinSegmentTime);
+        end
+
+        if ~isfinite(dts) || dts <= 0
+            dts = MinSegmentTime;
+        end
+
+        t_raw(k) = t_raw(k-1) + dts;
+
+    end
+
+end
+
+%  7. REMUESTREO A TIEMPO UNIFORME
+%% -----------------------------------------------------------------------
+
+dtvec = diff(t_raw);
+dtvec = dtvec(dtvec > 0 & isfinite(dtvec));
+
+if isempty(dtvec)
+    dt = 0.05;
+else
+    dt = max(median(dtvec), 1e-4);
+end
+
+t0 = t_raw(1);
+tF = t_raw(end);
+
+if tF <= t0
+    tF = t0 + dt*(nRaw-1);
+end
+
+t = (t0:dt:tF)';
+
+if numel(t) < 2
+    t = [t0; t0+dt];
+end
+
+N = numel(t);
+
+theta_ref = interp1(t_raw, theta_ref_raw, t,'linear','extrap');
+z_ref     = interp1(t_raw, z_ref_raw,     t,'linear','extrap');
+
+isHel = interp1(t_raw, double(isHelical_raw), t,'nearest','extrap') > 0.5;
+isReverse = interp1(t_raw, double(isReverse_raw), t,'nearest','extrap') > 0.5;
+
+localSpeedPct   = interp1(t_raw, localSpeedPct_raw,   t,'nearest','extrap');
+limitScalePct   = interp1(t_raw, limitScalePct_raw,   t,'linear','extrap');
+mandrelSpeedPct = interp1(t_raw, mandrelSpeedPct_raw, t,'nearest','extrap');
+
+theta_ref = theta_ref(:);
+z_ref     = z_ref(:);
+
+isHel     = isHel(:);
+isReverse = isReverse(:);
+
+localSpeedPct   = localSpeedPct(:);
+limitScalePct   = limitScalePct(:);
+mandrelSpeedPct = mandrelSpeedPct(:);
+
+if zeroSpeedMode
+    theta_ref(:) = theta_ref(1);
+    z_ref(:)     = z_ref(1);
+    localSpeedPct(:) = 0;
+    limitScalePct(:) = 0;
+    mandrelSpeedPct(:) = 0;
+end
+
+fw = max(5, min(120, floor(N/10)));
+
+%  8. DIAMETRO DEL CILINDRO
+%% -----------------------------------------------------------------------
+
+D_mm = read_param_from_excel(xlsxFile, ...
+    {'D_mm','D1_mm','Diameter','Diametro'}, NaN);
+
+if isnan(D_mm) || D_mm <= 0
+    warning('Diametro no encontrado en XLSX. Se usa D = 200 mm.');
+    D_mm = 200;
+end
+
+R_mm = D_mm / 2;
+
+%  9. PARAMETROS FISICOS
+%% -----------------------------------------------------------------------
+
+% Mandril: SGM7G 5.5 kW + reduccion 10:1
+MandrelReduction         = 10;
+MandrelMotorTorqueNom_Nm = 35;
+MandrelMotorTorqueMax_Nm = 102;
+MandrelMotorInertia_kgm2 = 89e-4;
+J_mandril_total          = 22.73;
+
+% Carrito: SGM7A 1.5 kW + reduccion 5:1
+CarriageReduction         = 5;
+CarriageMotorTorqueNom_Nm = 4.9;
+CarriageMotorTorqueMax_Nm = 14.7;
+CarriageMotorInertia_kgm2 = 2e-4;
+J_carrito_total           = 0.673;
+
+J_motor_m_ref = MandrelMotorInertia_kgm2 * MandrelReduction^2;
+J_motor_s_ref = CarriageMotorInertia_kgm2 * CarriageReduction^2;
+
+J_m_eq = J_mandril_total + J_motor_m_ref;
+J_s_eq = J_carrito_total + J_motor_s_ref;
+
+T_m_nom = MandrelMotorTorqueNom_Nm * MandrelReduction;
+T_m_max = MandrelMotorTorqueMax_Nm * MandrelReduction;
+
+T_s_nom = CarriageMotorTorqueNom_Nm * CarriageReduction;
+T_s_max = CarriageMotorTorqueMax_Nm * CarriageReduction;
+
+tau_m = 0.35;
+tau_s = 0.04;
+
+%  10. PID
+%% -----------------------------------------------------------------------
+
+Kp_m = 4.5;
+Ki_m = 0.18;
+Kd_m = 0.12;
+
+Kp_s = 12.0;
+Ki_s = 0.18;
+Kd_s = 0.04;
+
+
+%  11. K_SYNC LOCAL
+%% -----------------------------------------------------------------------
+
+dTheta_ref = [0; diff(theta_ref)];
+dZ_ref     = [0; diff(z_ref)];
+
+K_sync_raw = zeros(N,1);
+msk = abs(dTheta_ref) > 1e-9;
+K_sync_raw(msk) = dZ_ref(msk) ./ dTheta_ref(msk);
+
+K_max = pi * D_mm / 360 * 15;
+K_sync_raw = max(-K_max, min(K_max, K_sync_raw));
+
+sw = min(51, max(3, floor(N/100)));
+
+if mod(sw,2) == 0
+    sw = sw + 1;
+end
+
+K_sync = movmean(K_sync_raw, sw);
+K_sync = fill_nearest(K_sync, msk);
+
+dtot = theta_ref(end) - theta_ref(1);
+
+if abs(dtot) > 1e-9
+    K_sync_global = (z_ref(end)-z_ref(1))/dtot;
+else
+    K_sync_global = 0;
+end
+
+%  11B. VARIABLES DE S-CURVE DEL CARRITO
+%% -----------------------------------------------------------------------
+
+z_min  = min(z_ref);
+z_max  = max(z_ref);
+z_span = z_max - z_min;
+
+decel_dist = max(z_span * SCurve_decel_pct, SCurve_decel_min);
+
+dist_to_limit = min(z_ref - z_min, z_max - z_ref);
+dist_to_limit = max(dist_to_limit, 0);
+
+q_limit = dist_to_limit ./ max(decel_dist, eps);
+q_limit = max(0, min(1, q_limit));
+
+v_scale = SCurve_limit_min_pct + ...
+    (1 - SCurve_limit_min_pct) .* smootherstep(q_limit);
+
+v_scale = max(SCurve_limit_min_pct, min(1, v_scale));
+
+z_ref_original = z_ref;
+
+% Limite local seguro del carrito
+vLimitSafe_mm_s = CarriageMax_mm_s .* (localSpeedPct/100) ./ SyncSafetyFactor;
+vLimitSafe_mm_s = max(vLimitSafe_mm_s, 1e-6);
+
+a_max_carrito = min(max(T_s_max * 1000 / J_s_eq, 100), ...
+                    CarriageMax_mm_s * 5);
+
+jerk_max = a_max_carrito / max(3*dt, 0.01);
+
+fprintf('[S-CURVE CARRITO] Zona decel = %.1f mm | minScale = %.1f%% | a_max = %.1f mm/s2 | jerk_max = %.0f mm/s3\n', ...
+    decel_dist, SCurve_limit_min_pct*100, a_max_carrito, jerk_max);
+
+%  12. SIMULACION MAESTRO-ESCLAVO
+%% -----------------------------------------------------------------------
+
+useCtrl = exist('tf','file') == 2 && exist('lsim','file') == 2;
+
+if useCtrl
+
+    fprintf('[INFO] Usando Control System Toolbox.\n');
+
+    s = tf('s');
+
+    Gm = (1/J_m_eq) / (s^2 + s/tau_m);
+    Gs = (1/J_s_eq) / (s^2 + s/tau_s);
+
+    Cm = Kp_m + Ki_m/s + Kd_m*s/(0.01*s+1);
+    Cs = Kp_s + Ki_s/s + Kd_s*s/(0.01*s+1);
+
+    Tm = feedback(Cm*Gm, 1);
+    Ts = feedback(Cs*Gs, 1);
+
+    theta_real = rad2deg(lsim(Tm, deg2rad(theta_ref), t));
+    theta_real = theta_real(:);
+
+    theta_error = theta_real - theta_ref;
+    v_ref_ff = gradient(z_ref, dt);
+
+    z_cmd_nom = z_ref + K_sync .* theta_error + tau_s .* v_ref_ff;
+    z_cmd_nom = min(max(z_cmd_nom, z_min), z_max);
+
+    z_cmd = apply_carriage_scurve_limiter( ...
+        z_cmd_nom, z_ref(1), vLimitSafe_mm_s, dt, z_min, z_max);
+
+    z_real = lsim(Ts, z_cmd, t);
+    z_real = z_real(:);
+    z_real = min(max(z_real, z_min), z_max);
+
+else
+
+    fprintf('[INFO] Sin Control System Toolbox. Usando primer orden discreto.\n');
+
+    [theta_real, z_real, z_cmd, z_cmd_nom] = sim_primer_orden_anclado( ...
+        theta_ref, z_ref, K_sync, dt, tau_m, tau_s, ...
+        z_min, z_max, vLimitSafe_mm_s);
+
+    Gm = [];
+    Gs = [];
+    Cm = [];
+    Cs = [];
+    Tm = [];
+    Ts = [];
+
+end
+
+%  13. ERRORES
+%% -----------------------------------------------------------------------
+
+e_theta = theta_real - theta_ref;
+e_z     = z_real     - z_ref;
+e_sync  = z_real     - z_cmd;
+e_cont  = sqrt(e_z.^2 + (R_mm.*deg2rad(e_theta)).^2);
+
+e_sync_filt = movmean(e_sync, fw);
+e_sync_rms  = sqrt(movmean(e_sync.^2, fw));
+
+%  14. VELOCIDADES Y ACELERACIONES
+%% -----------------------------------------------------------------------
+
+omega_ref_rpm  = gradient(theta_ref,  dt) * 60/360;
+omega_real_rpm = gradient(theta_real, dt) * 60/360;
+
+omega_ref_rad_s  = omega_ref_rpm  * 2*pi/60;
+omega_real_rad_s = omega_real_rpm * 2*pi/60;
+
+alpha_ref_rpm_s  = gradient(omega_ref_rpm,  dt);
+alpha_real_rpm_s = gradient(omega_real_rpm, dt);
+
+jerk_rot      = gradient(alpha_ref_rpm_s, dt);
+jerk_rot_filt = movmean(jerk_rot, fw);
+
+v_ref_mm_s     = gradient(z_ref,     dt);
+v_cmd_nom_mm_s = gradient(z_cmd_nom, dt);
+v_cmd_mm_s     = gradient(z_cmd,     dt);
+v_real_mm_s    = gradient(z_real,    dt);
+
+a_ref_mm_s2  = gradient(v_ref_mm_s,  dt);
+a_cmd_mm_s2  = gradient(v_cmd_mm_s,  dt);
+a_real_mm_s2 = gradient(v_real_mm_s, dt);
+
+jerk_lin      = gradient(a_cmd_mm_s2, dt);
+jerk_lin_filt = movmean(jerk_lin, fw);
+
+Mandrel_pct  = abs(omega_ref_rpm) / MandrelMax_rpm * 100;
+Carriage_pct = abs(v_cmd_mm_s)    / CarriageMax_mm_s * 100;
+
+rpm_plot_max = max(max(abs([omega_ref_rpm; omega_real_rpm])) * 1.3, 0.5);
+v_plot_max   = max(max(abs([v_ref_mm_s; v_cmd_mm_s; v_real_mm_s])) * 1.3, 0.5);
+pct_plot_max = min(max(max([Mandrel_pct; Carriage_pct; localSpeedPct; mandrelSpeedPct])*1.3, 2), 110);
+
+%  15. ACCIONES DE CONTROL
+%% -----------------------------------------------------------------------
+
+tw = min(25, max(3, floor(N/200)));
+
+e_th_f = movmean(e_theta, tw);
+e_z_f  = movmean(e_z, tw);
+
+ie_th = cumtrapz(t, e_th_f);
+ie_z  = cumtrapz(t, e_z_f);
+
+de_th = gradient(e_th_f, dt);
+de_z  = gradient(e_z_f, dt);
+
+u_m = Kp_m*e_th_f + Ki_m*ie_th + Kd_m*de_th;
+u_s = Kp_s*e_z_f  + Ki_s*ie_z  + Kd_s*de_z;
+
+u_m_norm = u_m / max(max(abs(u_m)), 1e-9);
+u_s_norm = u_s / max(max(abs(u_s)), 1e-9);
+
+%  16. TENDENCIAS
+%% -----------------------------------------------------------------------
+
+tw2 = min(40, max(5, floor(N/200)));
+
+z_ref_m_trend  = movmean(z_ref/1000, tw2);
+z_cmd_m_trend  = movmean(z_cmd/1000, tw2);
+z_real_m_trend = movmean(z_real/1000, tw2);
+
+vx_ref_norm  = movmean(v_ref_mm_s, tw2)  / CarriageMax_mm_s;
+vx_cmd_norm  = movmean(v_cmd_mm_s, tw2)  / CarriageMax_mm_s;
+vx_real_norm = movmean(v_real_mm_s, tw2) / CarriageMax_mm_s;
+
+w_ref_rad_trend  = movmean(omega_ref_rad_s, tw2);
+w_real_rad_trend = movmean(omega_real_rad_s, tw2);
+
+u_m_trend = movmean(u_m_norm, tw2);
+u_s_trend = movmean(u_s_norm, tw2);
+
+%  17. COORDENADAS 3D
+% ------------------------------------------------------------------------
+%  Referencia ideal y trayectoria real corregida.
+%% -----------------------------------------------------------------------
+
+x3_ref = z_ref;
+y3_ref = R_mm .* cosd(theta_ref);
+z3_ref = R_mm .* sind(theta_ref);
+
+x3 = z_real;
+y3 = R_mm .* cosd(theta_real);
+z3 = R_mm .* sind(theta_real);
+
+%  FIGURA 1: TENDENCIAS DE CONTROL
+%% =======================================================================
+
+figure('Name', sprintf('Tendencias - Speed %.0f%% / Hel %.0f%%', ...
+    SpeedPercent, HelicalSpeedPercent), 'NumberTitle','off');
+
+subplot(4,1,1);
+plot(t, z_ref_m_trend,  'b',   'LineWidth',1.2);
+hold on;
+plot(t, z_cmd_m_trend,  'g:',  'LineWidth',1.2);
+plot(t, z_real_m_trend, 'r--', 'LineWidth',1.3);
+safe_yline(z_min/1000, '--k', sprintf('z_{min}=%.0fmm', z_min));
+safe_yline(z_max/1000, '--k', sprintf('z_{max}=%.0fmm', z_max));
+grid on;
+ylabel('x [m]');
+title('Posicion carrito: referencia, comando seguro y respuesta real');
+legend('Referencia','Comando seguro','Real','Location','best');
+mark_limit_zones(t, limitScalePct);
+mark_helical_zones(t, isHel);
+
+subplot(4,1,2);
+plot(t, vx_ref_norm,  'b',   'LineWidth',1.1);
+hold on;
+plot(t, vx_cmd_norm,  'g:',  'LineWidth',1.3);
+plot(t, vx_real_norm, 'r--', 'LineWidth',1.3);
+safe_yline( 1,'--k','');
+safe_yline(-1,'--k','');
+safe_yline( 0,'-k','');
+grid on;
+ylabel('v_x / v_{max}');
+ylim([-1.15, 1.15]);
+title('Velocidad carrito: helicoidal + S-curve en limites');
+legend('Ref ideal','Cmd seguro','Real','Location','best');
+mark_limit_zones(t, limitScalePct);
+mark_helical_zones(t, isHel);
+
+subplot(4,1,3);
+plot(t, w_ref_rad_trend,  'k--','LineWidth',1.3);
+hold on;
+plot(t, w_real_rad_trend, 'm',  'LineWidth',1.3);
+safe_yline( MandrelMax_rad_s,'--r','');
+safe_yline(-MandrelMax_rad_s,'--r','');
+safe_yline(0,'-k','');
+grid on;
+ylabel('\omega_z [rad/s]');
+ylim([-MandrelMax_rad_s*1.15, MandrelMax_rad_s*1.15]);
+title('Mandril: baja en helicoidales, no baja por limites del carrito');
+legend('\omega ref','\omega real');
+mark_helical_zones(t, isHel);
+
+subplot(4,1,4);
+plot(t, u_m_trend, 'b', 'LineWidth',1.3);
+hold on;
+plot(t, u_s_trend, 'm', 'LineWidth',1.3);
+safe_yline( 1,'--k','');
+safe_yline(-1,'--k','');
+safe_yline( 0,'-k','');
+grid on;
+xlabel('t [s]');
+ylabel('u [-]');
+ylim([-1.15,1.15]);
+title('Acciones de control normalizadas');
+legend('u mandril','u carrito');
+mark_limit_zones(t, limitScalePct);
+mark_helical_zones(t, isHel);
+
+%  FIGURA 2: S-CURVE CARRITO
+%% =======================================================================
+
+figure('Name','S-Curve del carrito en limites','NumberTitle','off');
+
+subplot(4,1,1);
+plot(t, z_ref/1000,  'b',  'LineWidth',1.2);
+hold on;
+plot(t, z_cmd/1000,  'g:', 'LineWidth',1.3);
+plot(t, z_real/1000, 'r--','LineWidth',1.3);
+safe_yline(z_min/1000,'--k','z min');
+safe_yline(z_max/1000,'--k','z max');
+grid on;
+ylabel('Z [m]');
+title(sprintf('Carrito: referencia, comando seguro y real | Zona decel %.0f mm', decel_dist));
+legend('Referencia','Comando S-curve','Real');
+
+subplot(4,1,2);
+plot(t, v_ref_mm_s/CarriageMax_mm_s,  'b',  'LineWidth',1.1);
+hold on;
+plot(t, v_cmd_mm_s/CarriageMax_mm_s,  'g:', 'LineWidth',1.4);
+plot(t, v_real_mm_s/CarriageMax_mm_s, 'r--','LineWidth',1.3);
+safe_yline( 1,'--r','v_{max}');
+safe_yline(-1,'--r','-v_{max}');
+safe_yline(0,'-k','');
+grid on;
+ylabel('v/v_{max}');
+ylim([-1.15,1.15]);
+title('Velocidad del carrito limitada por helicoidal + S-curve');
+legend('Ref ideal','Cmd seguro','Real');
+
+subplot(4,1,3);
+plot(t, a_cmd_mm_s2,  'b',  'LineWidth',1.2);
+hold on;
+plot(t, a_real_mm_s2, 'r--','LineWidth',1.2);
+safe_yline( a_max_carrito,'--r',sprintf('+a_{max}=%.0f',a_max_carrito));
+safe_yline(-a_max_carrito,'--r',sprintf('-a_{max}=%.0f',a_max_carrito));
+safe_yline(0,'-k','');
+grid on;
+ylabel('a [mm/s^2]');
+title('Aceleracion carrito');
+legend('Cmd','Real');
+
+subplot(4,1,4);
+plot(t, jerk_lin, 'Color',[0.8 0.8 0.8],'LineWidth',0.8);
+hold on;
+plot(t, jerk_lin_filt, 'b', 'LineWidth',1.4);
+safe_yline( jerk_max,'--r',sprintf('+J_{max}=%.0f',jerk_max));
+safe_yline(-jerk_max,'--r',sprintf('-J_{max}=%.0f',jerk_max));
+safe_yline(0,'-k','');
+grid on;
+xlabel('Tiempo [s]');
+ylabel('J [mm/s^3]');
+title('Jerk del carrito');
+legend('Crudo','Filtrado');
+
+%  FIGURA 3: MONITOR EN TIEMPO REAL
+%% =======================================================================
+
+figMon = figure('Name','Monitor en tiempo real','NumberTitle','off');
+
+ax1 = subplot(6,1,1);
+hTref  = animatedline('LineWidth',1.2,'Color','b');
+hTreal = animatedline('LineWidth',1.2,'Color','r','LineStyle','--');
+grid on;
+ylabel('deg');
+title('Mandril - Posicion');
+legend('theta ref','theta real');
+
+ax2 = subplot(6,1,2);
+hZref  = animatedline('LineWidth',1.2,'Color','b');
+hZcmd  = animatedline('LineWidth',1.2,'Color','g','LineStyle',':');
+hZreal = animatedline('LineWidth',1.2,'Color','r','LineStyle','--');
+grid on;
+ylabel('mm');
+title('Carrito - Posicion');
+legend('Z ref','Z cmd seguro','Z real');
+
+ax3 = subplot(6,1,3);
+hWref  = animatedline('LineWidth',1.4,'Color','b');
+hWreal = animatedline('LineWidth',1.4,'Color','r','LineStyle','--');
+grid on;
+ylabel('rpm');
+title(sprintf('Mandril velocidad | limite +/- %.0f rpm', MandrelMax_rpm));
+legend('rpm ref','rpm real');
+ylim([-rpm_plot_max, rpm_plot_max]);
+
+ax4 = subplot(6,1,4);
+hVref  = animatedline('LineWidth',1.2,'Color','b');
+hVcmd  = animatedline('LineWidth',1.3,'Color','g','LineStyle',':');
+hVreal = animatedline('LineWidth',1.3,'Color','r','LineStyle','--');
+grid on;
+ylabel('mm/s');
+title(sprintf('Carrito velocidad | limite +/- %.0f mm/s', CarriageMax_mm_s));
+legend('V ref','V cmd seguro','V real');
+ylim([-v_plot_max, v_plot_max]);
+
+ax5 = subplot(6,1,5);
+hMpct = animatedline('LineWidth',1.2,'Color','b');
+hCpct = animatedline('LineWidth',1.2,'Color','r');
+hLocal = animatedline('LineWidth',1.1,'Color','k','LineStyle','--');
+hMandrelLocal = animatedline('LineWidth',1.1,'Color','m','LineStyle',':');
+grid on;
+ylabel('Uso [%]');
+ylim([0, pct_plot_max]);
+title(sprintf('Uso porcentual | Speed %.0f%% | Hel %.0f%%', ...
+    SpeedPercent, HelicalSpeedPercent));
+legend('Mandril uso','Carrito uso','Carrito local','Mandril local');
+safe_yline(100,'--r','100%');
+
+ax6 = subplot(6,1,6);
+hEs  = animatedline('LineWidth',0.8,'Color',[0.6 0.6 0.6]);
+hEsf = animatedline('LineWidth',1.5,'Color','r');
+grid on;
+xlabel('Tiempo [s]');
+ylabel('e sync [mm]');
+title('Error de sincronismo');
+legend('Crudo','Filtrado');
+
+linkaxes([ax1 ax2 ax3 ax4 ax5 ax6],'x');
+
+xlim(ax1,[t(1),t(end)]);
+set_axis_limits(ax1,[t(1),t(end)],[theta_ref; theta_real],10);
+set_axis_limits(ax2,[t(1),t(end)],[z_ref; z_cmd; z_real],10);
+xlim(ax3,[t(1),t(end)]);
+xlim(ax4,[t(1),t(end)]);
+xlim(ax5,[t(1),t(end)]);
+set_axis_limits(ax6,[t(1),t(end)],[e_sync; e_sync_filt],1);
+
+%  FIGURA 4: ANIMACION 3D
+%% =======================================================================
+
+fig3D = figure('Name','Trayectoria 3D - Cilindro','NumberTitle','off');
+clf;
+hold on;
+grid on;
+axis equal;
+view(3);
+
+xlabel('X axial [mm]');
+ylabel('Y [mm]');
+zlabel('Z [mm]');
+
+xlim(lim_with_margin([x3_ref; x3], 0.2*R_mm));
+ylim([-1.3*R_mm, 1.3*R_mm]);
+zlim([-1.3*R_mm, 1.3*R_mm]);
+
+[TH,XX] = meshgrid(linspace(0,2*pi,80), linspace(min(x3_ref),max(x3_ref),60));
+
+surf(XX, R_mm*cos(TH), R_mm*sin(TH), ...
+    'FaceAlpha',0.08, ...
+    'EdgeAlpha',0.10, ...
+    'HandleVisibility','off');
+
+hPathRef = plot3(x3_ref(1),y3_ref(1),z3_ref(1),':', ...
+    'LineWidth',1.0, ...
+    'Color',[0.3 0.3 1], ...
+    'DisplayName','Referencia');
+
+hPath  = plot3(x3(1),y3(1),z3(1),'-', ...
+    'LineWidth',1.6, ...
+    'Color','r', ...
+    'DisplayName','Real corregida');
+
+hPoint = plot3(x3(1),y3(1),z3(1),'o', ...
+    'MarkerSize',7, ...
+    'LineWidth',1.3, ...
+    'Color','k', ...
+    'DisplayName','Actual');
+
+plot3(x3(1),y3(1),z3(1),'gs', ...
+    'MarkerSize',9, ...
+    'LineWidth',1.5, ...
+    'DisplayName','Inicio');
+
+plot3(x3(end),y3(end),z3(end),'rd', ...
+    'MarkerSize',9, ...
+    'LineWidth',1.5, ...
+    'DisplayName','Fin');
+
+legend('Location','best');
+
+%  LOOP UNICO: monitor + 3D
+%% -----------------------------------------------------------------------
+
+stepAnim = max(1, round(N/1000));
+
+pauseMin = 0.001;
+pauseMax = 0.12;
+prevK = 1;
+
+for k = 1:stepAnim:N
+
+    addpoints(hTref,  t(k), theta_ref(k));
+    addpoints(hTreal, t(k), theta_real(k));
+
+    addpoints(hZref,  t(k), z_ref(k));
+    addpoints(hZcmd,  t(k), z_cmd(k));
+    addpoints(hZreal, t(k), z_real(k));
+
+    addpoints(hWref,  t(k), omega_ref_rpm(k));
+    addpoints(hWreal, t(k), omega_real_rpm(k));
+
+    addpoints(hVref,  t(k), v_ref_mm_s(k));
+    addpoints(hVcmd,  t(k), v_cmd_mm_s(k));
+    addpoints(hVreal, t(k), v_real_mm_s(k));
+
+    addpoints(hMpct,  t(k), Mandrel_pct(k));
+    addpoints(hCpct,  t(k), Carriage_pct(k));
+    addpoints(hLocal, t(k), localSpeedPct(k));
+    addpoints(hMandrelLocal, t(k), mandrelSpeedPct(k));
+
+    addpoints(hEs,    t(k), e_sync(k));
+    addpoints(hEsf,   t(k), e_sync_filt(k));
+
+    set(hPathRef, ...
+        'XData',x3_ref(1:k), ...
+        'YData',y3_ref(1:k), ...
+        'ZData',z3_ref(1:k));
+
+    set(hPath, ...
+        'XData',x3(1:k), ...
+        'YData',y3(1:k), ...
+        'ZData',z3(1:k));
+
+    set(hPoint, ...
+        'XData',x3(k), ...
+        'YData',y3(k), ...
+        'ZData',z3(k));
+
+    figure(fig3D);
+    title(sprintf('FW 3D | %d/%d | Z real=%.1f mm | theta=%.0f deg | mandril=%.2f rpm | carrito=%.2f mm/s', ...
+        k, N, z_real(k), theta_real(k), omega_real_rpm(k), v_real_mm_s(k)));
+
+    drawnow limitrate;
+
+    if k > 1
+        pauseAnim = (t(k) - t(prevK)) * AnimationTimeScale;
+        pauseAnim = min(max(pauseAnim, pauseMin), pauseMax);
+        pause(pauseAnim);
+    end
+
+    prevK = k;
+
+end
+
+set(hPathRef, 'XData',x3_ref,'YData',y3_ref,'ZData',z3_ref);
+set(hPath,    'XData',x3,'YData',y3,'ZData',z3);
+set(hPoint,   'XData',x3(end),'YData',y3(end),'ZData',z3(end));
+
+%  FIGURA 5: CONTROL MAESTRO-ESCLAVO
+%% =======================================================================
+
+figure('Name','Control maestro-esclavo','NumberTitle','off');
+
+subplot(3,1,1);
+plot(t,theta_ref,'b','LineWidth',1.2);
+hold on;
+plot(t,theta_real,'r--','LineWidth',1.2);
+grid on;
+ylabel('Mandril [deg]');
+legend('theta ref','theta real');
+title('Eje maestro: mandril');
+
+subplot(3,1,2);
+plot(t,z_ref,'b','LineWidth',1.2);
+hold on;
+plot(t,z_cmd,'g:','LineWidth',1.2);
+plot(t,z_real,'r--','LineWidth',1.2);
+grid on;
+ylabel('Carrito [mm]');
+legend('Z ref','Z cmd seguro','Z real');
+title('Eje esclavo: carrito');
+
+subplot(3,1,3);
+plot(t,e_sync,'Color',[0.7 0.7 0.7],'LineWidth',0.8);
+hold on;
+plot(t,e_sync_filt,'r','LineWidth',1.4);
+plot(t,e_sync_rms,'b--','LineWidth',1.2);
+safe_yline(0,'-k','');
+grid on;
+xlabel('Tiempo [s]');
+ylabel('e sync [mm]');
+legend('Crudo','Filtrado','RMS');
+title('Error de sincronismo');
+
+%  FIGURA 6: VELOCIDAD / ACELERACION / JERK
+%% =======================================================================
+
+figure('Name','Velocidades y aceleraciones','NumberTitle','off');
+
+subplot(3,2,1);
+plot(t,omega_ref_rpm,'b','LineWidth',1.2);
+hold on;
+plot(t,omega_real_rpm,'r--','LineWidth',1.2);
+safe_yline(MandrelMax_rpm,'--r','');
+safe_yline(-MandrelMax_rpm,'--r','');
+grid on;
+ylabel('rpm');
+title('Mandril - Velocidad');
+ylim([-rpm_plot_max, rpm_plot_max]);
+legend('Ref','Real');
+
+subplot(3,2,2);
+plot(t,v_ref_mm_s,'b','LineWidth',1.0);
+hold on;
+plot(t,v_cmd_mm_s,'g:','LineWidth',1.4);
+plot(t,v_real_mm_s,'r--','LineWidth',1.2);
+safe_yline(CarriageMax_mm_s,'--r','');
+safe_yline(-CarriageMax_mm_s,'--r','');
+grid on;
+ylabel('mm/s');
+title('Carrito - Velocidad con helicoidal + S-curve');
+ylim([-v_plot_max, v_plot_max]);
+legend('Ref ideal','Cmd seguro','Real');
+
+subplot(3,2,3);
+plot(t,alpha_ref_rpm_s,'b','LineWidth',1.2);
+hold on;
+plot(t,alpha_real_rpm_s,'r--','LineWidth',1.2);
+safe_yline(0,'-k','');
+grid on;
+ylabel('rpm/s');
+title('Mandril - Aceleracion');
+
+subplot(3,2,4);
+plot(t,a_cmd_mm_s2,'g:','LineWidth',1.3);
+hold on;
+plot(t,a_real_mm_s2,'r--','LineWidth',1.2);
+safe_yline(a_max_carrito,'--r','');
+safe_yline(-a_max_carrito,'--r','');
+safe_yline(0,'-k','');
+grid on;
+ylabel('mm/s^2');
+title('Carrito - Aceleracion segura');
+legend('Cmd','Real');
+
+subplot(3,2,5);
+plot(t,jerk_rot,'Color',[0.8 0.8 0.8],'LineWidth',0.8);
+hold on;
+plot(t,jerk_rot_filt,'b','LineWidth',1.4);
+safe_yline(0,'-k','');
+grid on;
+xlabel('Tiempo [s]');
+ylabel('rpm/s^2');
+title('Mandril - Jerk');
+legend('Crudo','Filtrado');
+
+subplot(3,2,6);
+plot(t,jerk_lin,'Color',[0.8 0.8 0.8],'LineWidth',0.8);
+hold on;
+plot(t,jerk_lin_filt,'b','LineWidth',1.4);
+safe_yline(jerk_max,'--r','');
+safe_yline(-jerk_max,'--r','');
+safe_yline(0,'-k','');
+grid on;
+xlabel('Tiempo [s]');
+ylabel('mm/s^3');
+title('Carrito - Jerk seguro');
+legend('Crudo','Filtrado');
+
+sgtitle('Velocidad -> Aceleracion -> Jerk');
+
+%  FIGURA 7: USO PORCENTUAL
+%% =======================================================================
+
+figure('Name','Uso porcentual','NumberTitle','off');
+
+plot(t,Mandrel_pct,'b','LineWidth',1.2);
+hold on;
+plot(t,Carriage_pct,'r','LineWidth',1.2);
+plot(t,mandrelSpeedPct,'m:','LineWidth',1.1);
+plot(t,localSpeedPct,'k--','LineWidth',1.0);
+plot(t,limitScalePct,'c:','LineWidth',1.0);
+safe_yline(100,'--r','Limite 100%');
+grid on;
+xlabel('Tiempo [s]');
+ylabel('Uso [%]');
+title(sprintf('Uso velocidad | Speed %.0f%% | Hel %.0f%%', ...
+    SpeedPercent, HelicalSpeedPercent));
+legend('Uso mandril','Uso carrito','Speed mandril local','Speed carrito local','Limit scale');
+
+%  FIGURA 8: ERRORES
+%% =======================================================================
+
+figure('Name','Errores de seguimiento','NumberTitle','off');
+
+subplot(3,1,1);
+plot(t,e_theta,'b','LineWidth',1.2);
+safe_yline(0,'-k','');
+grid on;
+ylabel('e theta [deg]');
+title('Error mandril');
+
+subplot(3,1,2);
+plot(t,e_z,'b','LineWidth',1.2);
+safe_yline(0,'-k','');
+grid on;
+ylabel('e Z [mm]');
+title('Error carrito');
+
+subplot(3,1,3);
+plot(t,e_cont,'m','LineWidth',1.2);
+safe_yline(0,'-k','');
+grid on;
+xlabel('Tiempo [s]');
+ylabel('e contorno [mm]');
+title('Error de contorno combinado');
+
+
+%  FIGURA 9: K_SYNC
+%% =======================================================================
+
+figure('Name','K sync','NumberTitle','off');
+
+plot(t, K_sync,'b','LineWidth',1.2);
+safe_yline(K_sync_global,'--r',sprintf('Global=%.4f mm/deg',K_sync_global));
+grid on;
+xlabel('Tiempo [s]');
+ylabel('K sync [mm/deg]');
+title('Relacion de sincronismo mandril-carrito');
+
+%  REPORTE EN CONSOLA
+%% -----------------------------------------------------------------------
+
+fprintf('\n========================================================\n');
+fprintf(' FILAMENT WINDING - CONTROL MAESTRO-ESCLAVO\n');
+fprintf('========================================================\n');
+fprintf(' Archivo        : %s\n', xlsxFile);
+fprintf(' Hoja           : %s\n', sheetName);
+fprintf(' D cilindro     : %.1f mm\n', D_mm);
+fprintf(' SpeedPercent   : %.1f %%\n', SpeedPercent);
+fprintf(' HelicalSpeed   : %.1f %%\n', HelicalSpeedPercent);
+fprintf(' Speed hel. ef. : %.2f %%\n', SpeedPercent*HelicalSpeedPercent/100);
+fprintf(' Mandril max    : +/- %.0f rpm\n', MandrelMax_rpm);
+fprintf(' Carrito max    : +/- %.0f mm/s\n', CarriageMax_mm_s);
+fprintf(' Puntos N       : %d\n', N);
+fprintf(' dt             : %.5f s\n', dt);
+fprintf(' Tiempo total   : %.2f s\n', t(end));
+fprintf('--------------------------------------------------------\n');
+fprintf(' MANDRIL\n');
+fprintf(' Baja en helicoidales, no baja por limites del carrito.\n');
+fprintf('--------------------------------------------------------\n');
+fprintf(' CARRITO\n');
+fprintf(' Baja en helicoidales y baja adicionalmente en limites/reversas.\n');
+fprintf(' Recorrido      : %.1f mm\n', z_span);
+fprintf(' Zona decel     : %.1f mm\n', decel_dist);
+fprintf(' Min scale      : %.1f %%\n', SCurve_limit_min_pct*100);
+fprintf(' a_max          : %.1f mm/s2\n', a_max_carrito);
+fprintf(' Jerk max ref.  : %.0f mm/s3\n', jerk_max);
+fprintf('--------------------------------------------------------\n');
+fprintf(' K_sync global  : %.6f mm/deg\n', K_sync_global);
+fprintf(' tau_m / tau_s  : %.3f s / %.3f s\n', tau_m, tau_s);
+fprintf(' J_m_eq         : %.4f kg*m^2\n', J_m_eq);
+fprintf(' J_s_eq         : %.4f kg*m^2\n', J_s_eq);
+fprintf('--------------------------------------------------------\n');
+fprintf(' Error theta max: %.4f deg\n', max(abs(e_theta)));
+fprintf(' Error Z max    : %.4f mm\n', max(abs(e_z)));
+fprintf(' Error sync max : %.4f mm\n', max(abs(e_sync)));
+fprintf(' Error cont max : %.4f mm\n', max(abs(e_cont)));
+fprintf('--------------------------------------------------------\n');
+fprintf(' Uso max mandril: %.1f %%\n', max(Mandrel_pct));
+fprintf(' Uso max carrito: %.1f %%\n', max(Carriage_pct));
+fprintf(' Tramos helic.  : %d puntos\n', nnz(isHel));
+fprintf(' Reversas       : %d puntos\n', nnz(isReverse));
+fprintf('========================================================\n\n');
+
+%  SALIDA ESTRUCTURADA
+%% -----------------------------------------------------------------------
+
+OUT = struct();
+
+OUT.file = xlsxFile;
+OUT.sheet = sheetName;
+
+OUT.geometry.D_mm = D_mm;
+OUT.geometry.R_mm = R_mm;
+
+OUT.machine.SpeedPercent = SpeedPercent;
+OUT.machine.HelicalSpeedPercent = HelicalSpeedPercent;
+OUT.machine.MandrelMax_rpm = MandrelMax_rpm;
+OUT.machine.CarriageMax_mm_s = CarriageMax_mm_s;
+OUT.machine.localSpeedPct = localSpeedPct;
+OUT.machine.limitScalePct = limitScalePct;
+OUT.machine.mandrelSpeedPct = mandrelSpeedPct;
+OUT.machine.isHelical = isHel;
+OUT.machine.isReverse = isReverse;
+
+OUT.scurve.z_cmd_nom = z_cmd_nom;
+OUT.scurve.z_cmd_safe = z_cmd;
+OUT.scurve.vLimitSafe_mm_s = vLimitSafe_mm_s;
+OUT.scurve.decel_dist_mm = decel_dist;
+OUT.scurve.a_max_mm_s2 = a_max_carrito;
+OUT.scurve.jerk_max_mm_s3 = jerk_max;
+
+OUT.model.J_m_eq = J_m_eq;
+OUT.model.J_s_eq = J_s_eq;
+OUT.model.tau_m = tau_m;
+OUT.model.tau_s = tau_s;
+OUT.model.T_m_max = T_m_max;
+OUT.model.T_s_max = T_s_max;
+
+OUT.reference.t = t;
+OUT.reference.theta_ref = theta_ref;
+OUT.reference.z_ref = z_ref;
+
+OUT.control.theta_real = theta_real;
+OUT.control.z_real = z_real;
+OUT.control.z_cmd = z_cmd;
+OUT.control.z_cmd_nom = z_cmd_nom;
+OUT.control.K_sync = K_sync;
+OUT.control.K_sync_global = K_sync_global;
+
+OUT.errors.e_theta = e_theta;
+OUT.errors.e_z = e_z;
+OUT.errors.e_sync = e_sync;
+OUT.errors.e_cont = e_cont;
+
+OUT.velocity.omega_ref_rpm = omega_ref_rpm;
+OUT.velocity.omega_real_rpm = omega_real_rpm;
+OUT.velocity.v_ref_mm_s = v_ref_mm_s;
+OUT.velocity.v_cmd_mm_s = v_cmd_mm_s;
+OUT.velocity.v_real_mm_s = v_real_mm_s;
+OUT.velocity.Mandrel_pct = Mandrel_pct;
+OUT.velocity.Carriage_pct = Carriage_pct;
+
+OUT.acceleration.alpha_ref = alpha_ref_rpm_s;
+OUT.acceleration.alpha_real = alpha_real_rpm_s;
+OUT.acceleration.a_cmd = a_cmd_mm_s2;
+OUT.acceleration.a_real = a_real_mm_s2;
+OUT.acceleration.jerk_rot = jerk_rot_filt;
+OUT.acceleration.jerk_lin = jerk_lin_filt;
+
+OUT.pid.Kp_m = Kp_m;
+OUT.pid.Ki_m = Ki_m;
+OUT.pid.Kd_m = Kd_m;
+OUT.pid.Kp_s = Kp_s;
+OUT.pid.Ki_s = Ki_s;
+OUT.pid.Kd_s = Kd_s;
+
+OUT.transfer.Gm = Gm;
+OUT.transfer.Gs = Gs;
+OUT.transfer.Cm = Cm;
+OUT.transfer.Cs = Cs;
+OUT.transfer.Tm = Tm;
+OUT.transfer.Ts = Ts;
+
+OUT.actions.u_m = u_m_norm;
+OUT.actions.u_s = u_s_norm;
+
+end
+
+%  FUNCIONES AUXILIARES
+%% =======================================================================
+
+function sheets = get_sheet_names(f)
+
+try
+    sheets = sheetnames(f);
+catch
+    [~,sheets] = xlsfinfo(f);
+    sheets = string(sheets);
+end
+
+end
+
+function col = find_column(T, cands)
+
+col = '';
+vars = T.Properties.VariableNames;
+
+for i = 1:numel(cands)
+    ix = find(strcmpi(vars,cands{i}),1);
+    if ~isempty(ix)
+        col = vars{ix};
+        return;
+    end
+end
+
+end
+
+function val = read_param_from_excel(f, names, def)
+
+val = def;
+
+try
+    sheets = get_sheet_names(f);
+
+    if ~any(strcmpi(sheets,'Parametros'))
+        return;
+    end
+
+    P = readtable(f,'Sheet','Parametros','VariableNamingRule','preserve');
+    vars = P.Properties.VariableNames;
+
+    for i = 1:numel(vars)
+        for j = 1:numel(names)
+            if strcmpi(vars{i},names{j})
+                v = to_double(P.(vars{i})(1));
+                if isfinite(v)
+                    val = v;
+                    return;
+                end
+            end
+        end
+    end
+
+    ni = [];
+    vi = [];
+
+    for i = 1:numel(vars)
+        vl = lower(vars{i});
+
+        if contains(vl,'param') || ...
+           contains(vl,'name') || ...
+           contains(vl,'variable') || ...
+           contains(vl,'nombre')
+            ni = i;
+        end
+
+        if contains(vl,'valor') || contains(vl,'value')
+            vi = i;
+        end
+    end
+
+    if ~isempty(ni) && ~isempty(vi)
+
+        pN = string(P.(vars{ni}));
+        pV = P.(vars{vi});
+
+        for i = 1:numel(pN)
+            for j = 1:numel(names)
+                if strcmpi(strtrim(pN(i)),names{j})
+                    v = to_double(pV(i));
+                    if isfinite(v)
+                        val = v;
+                        return;
+                    end
+                end
+            end
+        end
+
+    end
+
+catch
+end
+
+end
+
+function val = to_double(x)
+
+if isnumeric(x)
+    val = double(x(1));
+elseif iscell(x)
+    val = str2double(char(x{1}));
+elseif isstring(x)
+    val = str2double(char(x(1)));
+elseif ischar(x)
+    val = str2double(x);
+else
+    val = NaN;
+end
+
+end
+
+function K = fill_nearest(K, mask)
+
+idxOk = find(mask);
+idxZ  = find(~mask);
+
+if isempty(idxOk) || isempty(idxZ)
+    return;
+end
+
+for i = 1:numel(idxZ)
+    [~,n] = min(abs(idxOk-idxZ(i)));
+    K(idxZ(i)) = K(idxOk(n));
+end
+
+end
+
+function z_safe = apply_carriage_scurve_limiter(z_target, z0, vLimitSafe, dt, z_min, z_max)
+
+N = numel(z_target);
+
+z_safe = zeros(N,1);
+z_safe(1) = clamp_value(z0, z_min, z_max);
+
+for k = 2:N
+
+    target = clamp_value(z_target(k), z_min, z_max);
+
+    maxStep = abs(vLimitSafe(k)) * dt;
+    maxStep = max(maxStep, 1e-9);
+
+    dz = target - z_safe(k-1);
+
+    dz = clamp_value(dz, -maxStep, maxStep);
+
+    z_safe(k) = z_safe(k-1) + dz;
+
+    z_safe(k) = clamp_value(z_safe(k), z_min, z_max);
+
+end
+
+end
+
+function [theta_real, z_real, z_cmd, z_cmd_nom] = sim_primer_orden_anclado( ...
+    theta_ref, z_ref, K_sync, dt, tau_m, tau_s, ...
+    z_min, z_max, vLimitSafe_mm_s)
+
+N = numel(theta_ref);
+
+theta_real = zeros(N,1);
+z_real     = zeros(N,1);
+z_cmd      = zeros(N,1);
+z_cmd_nom  = zeros(N,1);
+
+theta_real(1) = theta_ref(1);
+z_real(1)     = z_ref(1);
+z_cmd(1)      = z_ref(1);
+z_cmd_nom(1)  = z_ref(1);
+
+am  = min(dt/tau_m, 0.99);
+as  = min(dt/tau_s, 0.99);
+Kff = tau_s;
+
+v_ref = gradient(z_ref, dt);
+
+for k = 2:N
+
+    theta_real(k) = theta_real(k-1) + ...
+        am*(theta_ref(k) - theta_real(k-1));
+
+    theta_error = theta_real(k) - theta_ref(k);
+
+    z_cmd_nom(k) = z_ref(k) + K_sync(k)*theta_error + Kff*v_ref(k);
+    z_cmd_nom(k) = clamp_value(z_cmd_nom(k), z_min, z_max);
+
+    maxStep = abs(vLimitSafe_mm_s(k)) * dt;
+    maxStep = max(maxStep, 1e-9);
+
+    dz = z_cmd_nom(k) - z_cmd(k-1);
+    dz = clamp_value(dz, -maxStep, maxStep);
+
+    z_cmd(k) = z_cmd(k-1) + dz;
+    z_cmd(k) = clamp_value(z_cmd(k), z_min, z_max);
+
+    z_real(k) = z_real(k-1) + as*(z_cmd(k) - z_real(k-1));
+    z_real(k) = clamp_value(z_real(k), z_min, z_max);
+
+end
+
+end
+
+function set_axis_limits(ax, xLim, yData, margin)
+
+axes(ax);
+xlim(xLim);
+ylim(lim_with_margin(yData, margin));
+
+end
+
+function lims = lim_with_margin(data, margin)
+
+data = data(isfinite(data));
+
+if isempty(data)
+    lims = [-1,1];
+    return;
+end
+
+yMn = min(data);
+yMx = max(data);
+
+lims = [yMn-margin, yMx+margin];
+
+end
+
+function safe_yline(val, style, lbl)
+
+if exist('yline','file') == 2
+
+    if isempty(lbl)
+        yline(val,style);
+    else
+        yline(val,style,lbl);
+    end
+
+else
+
+    xl = xlim;
+    plot(xl,[val val],style,'LineWidth',1.0);
+
+    if ~isempty(lbl)
+        text(xl(2),val,['  ' lbl]);
+    end
+
+end
+
+end
+
+function mark_helical_zones(t, isHel)
+
+if ~any(isHel)
+    return;
+end
+
+yl = ylim;
+
+starts = find(diff([0;isHel(:)]) == 1);
+ends   = find(diff([isHel(:);0]) == -1);
+
+for i = 1:numel(starts)
+
+    x1 = t(starts(i));
+    x2 = t(ends(i));
+
+    patch([x1 x2 x2 x1], ...
+          [yl(1) yl(1) yl(2) yl(2)], ...
+          [0.85 0.85 0.85], ...
+          'FaceAlpha',0.3, ...
+          'EdgeColor','none', ...
+          'HandleVisibility','off');
+
+end
+
+end
+
+function mark_limit_zones(t, limitScalePct)
+
+active = limitScalePct < 99;
+
+if ~any(active)
+    return;
+end
+
+yl = ylim;
+
+starts = find(diff([0;active(:)]) == 1);
+ends   = find(diff([active(:);0]) == -1);
+
+for i = 1:numel(starts)
+
+    x1 = t(starts(i));
+    x2 = t(ends(i));
+
+    patch([x1 x2 x2 x1], ...
+          [yl(1) yl(1) yl(2) yl(2)], ...
+          [1.0 0.75 0.75], ...
+          'FaceAlpha',0.25, ...
+          'EdgeColor','none', ...
+          'HandleVisibility','off');
+
+end
+
+end
+
+function y = clamp_value(x, xmin, xmax)
+
+y = min(max(x, xmin), xmax);
+
+end
+
+function y = smootherstep(x)
+
+x = max(0, min(1, x));
+
+% smootherstep = 6x^5 - 15x^4 + 10x^3
+y = x.^3 .* (x .* (x*6 - 15) + 10);
+
+end
